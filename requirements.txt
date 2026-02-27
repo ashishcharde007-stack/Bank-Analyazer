@@ -4,3 +4,5 @@ pdfplumber
 pandas
 openpyxl
 python-multipart
+gunicorn
+uvicorn[standard]
