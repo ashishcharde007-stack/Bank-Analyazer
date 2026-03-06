@@ -1,0 +1,188 @@
+from fastapi import HTTPException
+import pdfplumber
+import pandas as pd
+from datetime import datetime
+
+# OCR imports (for BOB scanned PDFs)
+import pytesseract
+from pdf2image import convert_from_bytes
+import re
+
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+
+def parse_hdfc_pdf(file_stream, password=None):  # ✅ added password
+
+    transactions = []
+    current_txn = None
+
+    # ✅ only this block added
+    try:
+        pdf = pdfplumber.open(file_stream, password=password)
+    except Exception:
+        raise HTTPException(status_code=401, detail={"error": "PASSWORD_REQUIRED"})
+
+    with pdf:
+        for page in pdf.pages:
+
+            words = page.extract_words()
+
+            rows = {}
+            for w in words:
+                top = round(w["top"], 0)
+                rows.setdefault(top, []).append(w)
+
+            for row_words in rows.values():
+
+                row_words = sorted(row_words, key=lambda x: x["x0"])
+                full_row = " ".join([w["text"] for w in row_words])
+
+                if "Date" in full_row and "Narration" in full_row:
+                    continue
+
+                first_word = row_words[0]["text"]
+
+                if "/" in first_word and len(first_word) >= 8:
+                    try:
+                        date = datetime.strptime(first_word, "%d/%m/%y")
+
+                        narration = ""
+                        ref_no = ""
+                        value_date = ""
+                        withdrawal = ""
+                        deposit = ""
+                        balance = ""
+
+                        for w in row_words:
+                            x = w["x0"]
+
+                            if 60 < x < 250:
+                                narration += w["text"] + " "
+                            elif 250 <= x < 330:
+                                ref_no += w["text"] + " "
+                            elif 330 <= x < 390:
+                                value_date += w["text"] + " "
+                            elif 390 <= x < 470:
+                                withdrawal += w["text"] + " "
+                            elif 470 <= x < 550:
+                                deposit += w["text"] + " "
+                            elif x >= 550:
+                                balance += w["text"] + " "
+
+                        withdrawal = (
+                            float(withdrawal.replace(",", "").strip())
+                            if withdrawal.strip()
+                            else 0.0
+                        )
+                        deposit = (
+                            float(deposit.replace(",", "").strip())
+                            if deposit.strip()
+                            else 0.0
+                        )
+                        balance = (
+                            float(balance.replace(",", "").strip())
+                            if balance.strip()
+                            else 0.0
+                        )
+
+                        transactions.append(
+                            {
+                                "date": date,
+                                "narration": narration.strip(),
+                                "ref_no": ref_no.strip(),
+                                "value_date": value_date.strip(),
+                                "debit": withdrawal,
+                                "credit": deposit,
+                                "balance": balance,
+                            }
+                        )
+
+                    except:
+                        continue
+
+    df = pd.DataFrame(transactions)
+    return df
+
+
+# bob code
+def parse_bob_pdf(file_stream, password=None):
+    transactions = []
+
+    try:
+        # Always rewind stream
+        file_stream.seek(0)
+
+        # Convert PDF → Images (no pdfplumber)
+        images = convert_from_bytes(
+            file_stream.read(), dpi=300, poppler_path=r"C:\Users\Ashish\Downloads\Release-25.12.0-0\poppler-25.12.0\Library\bin"
+        )
+
+    except Exception as e:
+        raise HTTPException(400, f"Failed to read PDF: {str(e)}")
+
+    text = ""
+
+    # Run OCR on each page
+    for i, img in enumerate(images):
+        ocr_text = pytesseract.image_to_string(img, config="--psm 6")
+        print(f"\n===== OCR PAGE {i+1} SAMPLE =====\n{ocr_text[:1000]}")
+        text += ocr_text
+
+    if not text.strip():
+        raise HTTPException(400, "OCR failed to read this statement.")
+
+    lines = text.split("\n")
+
+    prev_balance = None
+
+    for line in lines:
+
+        # Find date like 01-06-2022 OR OCR mistakes like O1-06-2O22
+        line_clean = line.replace("O", "0")
+
+        match = re.search(r"\d{2}-\d{2}-\d{4}", line_clean)
+        if not match:
+            continue
+
+        try:
+            txn_date = datetime.strptime(match.group(), "%d-%m-%Y")
+
+            # Extract numbers (amounts)
+            numbers = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", line_clean)
+            if not numbers:
+                continue
+
+            balance = float(numbers[-1].replace(",", ""))
+
+            credit = 0.0
+            debit = 0.0
+
+            if prev_balance is not None:
+                diff = balance - prev_balance
+                if diff > 0:
+                    credit = diff
+                else:
+                    debit = abs(diff)
+
+            prev_balance = balance
+
+            narration = line_clean.split(match.group())[1]
+            narration = re.sub(r"\d{1,3}(?:,\d{3})*\.\d{2}", "", narration)
+
+            transactions.append(
+                {
+                    "date": txn_date,
+                    "narration": narration.strip(),
+                    "ref_no": "",
+                    "value_date": txn_date.strftime("%d-%m-%Y"),
+                    "debit": debit,
+                    "credit": credit,
+                    "balance": balance,
+                }
+            )
+
+        except Exception:
+            continue
+
+    df = pd.DataFrame(transactions)
+    return df

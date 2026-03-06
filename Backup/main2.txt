@@ -8,7 +8,6 @@ import re
 from datetime import datetime
 
 from app.parser import parse_hdfc_pdf, parse_sbi_pdf
-from app.analyzer import analyze_emi
 
 app = FastAPI(title="Bank Statement Analyzer V1")
 
@@ -528,8 +527,7 @@ def process_statement(contents: bytes, password: str | None = None):
 
     loan_metrics = generate_loan_readiness(summary, monthly_summary)
 
-    emi_analysis = analyze_emi(df)
-    return df, summary, monthly_summary, loan_metrics, account_info, emi_analysis
+    return df, summary, monthly_summary, loan_metrics, account_info
 
 
 # -------------------------------
@@ -546,8 +544,8 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
-        process_statement(contents, password)
+    df, summary, monthly_summary, loan_metrics, account_info = process_statement(
+        contents, password
     )
 
     if not monthly_summary.empty:
@@ -568,7 +566,6 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
         "summary": summary,
         "loan_analysis": loan_metrics,
         "monthly_summary": monthly_summary.to_dict(orient="records"),
-        "emi_analysis": emi_analysis,
         "total_transactions": len(df),
     }
 
@@ -584,8 +581,8 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
-        process_statement(contents, password)
+    df, summary, monthly_summary, loan_metrics, account_info = process_statement(
+        contents, password
     )
 
     df_export = df.copy()
@@ -605,9 +602,6 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
         pd.DataFrame(loan_metrics.items(), columns=["Metric", "Value"]).to_excel(
             writer, index=False, sheet_name="Loan Analysis"
         )
-        pd.DataFrame(
-            emi_analysis["emi_summary"].items(), columns=["Metric", "Value"]
-        ).to_excel(writer, index=False, sheet_name="EMI Analysis")
 
     output.seek(0)
     return StreamingResponse(

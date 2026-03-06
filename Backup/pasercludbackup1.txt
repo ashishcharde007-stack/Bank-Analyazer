@@ -1,0 +1,232 @@
+from fastapi import HTTPException
+import pdfplumber
+import pandas as pd
+from datetime import datetime
+
+
+def parse_hdfc_pdf(file_stream, password=None):  # ✅ added password
+
+    transactions = []
+    current_txn = None
+
+    # ✅ only this block added
+    try:
+        pdf = pdfplumber.open(file_stream, password=password)
+    except Exception:
+        raise HTTPException(status_code=401, detail={"error": "PASSWORD_REQUIRED"})
+
+    with pdf:
+        for page in pdf.pages:
+
+            words = page.extract_words()
+
+            rows = {}
+            for w in words:
+                top = round(w["top"], 0)
+                rows.setdefault(top, []).append(w)
+
+            for row_words in rows.values():
+
+                row_words = sorted(row_words, key=lambda x: x["x0"])
+                full_row = " ".join([w["text"] for w in row_words])
+
+                if "Date" in full_row and "Narration" in full_row:
+                    continue
+
+                first_word = row_words[0]["text"]
+
+                if "/" in first_word and len(first_word) >= 8:
+                    try:
+                        date = datetime.strptime(first_word, "%d/%m/%y")
+
+                        narration = ""
+                        ref_no = ""
+                        value_date = ""
+                        withdrawal = ""
+                        deposit = ""
+                        balance = ""
+
+                        for w in row_words:
+                            x = w["x0"]
+
+                            if 60 < x < 250:
+                                narration += w["text"] + " "
+                            elif 250 <= x < 330:
+                                ref_no += w["text"] + " "
+                            elif 330 <= x < 390:
+                                value_date += w["text"] + " "
+                            elif 390 <= x < 470:
+                                withdrawal += w["text"] + " "
+                            elif 470 <= x < 550:
+                                deposit += w["text"] + " "
+                            elif x >= 550:
+                                balance += w["text"] + " "
+
+                        withdrawal = (
+                            float(withdrawal.replace(",", "").strip())
+                            if withdrawal.strip()
+                            else 0.0
+                        )
+                        deposit = (
+                            float(deposit.replace(",", "").strip())
+                            if deposit.strip()
+                            else 0.0
+                        )
+                        balance = (
+                            float(balance.replace(",", "").strip())
+                            if balance.strip()
+                            else 0.0
+                        )
+
+                        transactions.append(
+                            {
+                                "date": date,
+                                "narration": narration.strip(),
+                                "ref_no": ref_no.strip(),
+                                "value_date": value_date.strip(),
+                                "debit": withdrawal,
+                                "credit": deposit,
+                                "balance": balance,
+                            }
+                        )
+
+                    except:
+                        continue
+
+    df = pd.DataFrame(transactions)
+    return df
+
+
+# SBI statement month abbreviations used in date parsing
+_SBI_MONTHS = {
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+}
+
+# SBI PDF column x-boundaries (measured from statement layout):
+#   Txn Date    : x < 90
+#   Value Date  : 90  <= x < 143
+#   Description : 143 <= x < 275
+#   Ref No.     : 275 <= x < 370
+#   Debit       : 370 <= x < 435
+#   Credit      : 435 <= x < 515
+#   Balance     : x  >= 515
+_SBI_DESC_X = 275
+_SBI_REF_X = 370
+_SBI_DEBIT_X = 435
+_SBI_CREDIT_X = 515
+
+
+def _sbi_parse_amount(text):
+    """Convert an SBI amount string (e.g. '1,50,000.00') to float."""
+    try:
+        return float(text.replace(",", "").strip())
+    except ValueError:
+        return 0.0
+
+
+def parse_sbi_pdf(file_stream, password=None):
+    """
+    Parse an SBI bank statement PDF and return a DataFrame with columns:
+        date, narration, ref_no, value_date, debit, credit, balance
+
+    The returned DataFrame has the same schema as parse_hdfc_pdf so both
+    can be processed by the same downstream pipeline.
+    """
+    transactions = []
+
+    try:
+        pdf = pdfplumber.open(file_stream, password=password)
+    except Exception:
+        raise HTTPException(status_code=401, detail={"error": "PASSWORD_REQUIRED"})
+
+    last_year = None  # carried forward for rows where year is on a separate line
+
+    with pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+
+            # Group words by their vertical (y) position to reconstruct rows
+            rows = {}
+            for w in words:
+                top = round(w["top"], 0)
+                rows.setdefault(top, []).append(w)
+
+            for _top, row_words in sorted(rows.items()):
+                row_words = sorted(row_words, key=lambda w: w["x0"])
+                texts = [w["text"] for w in row_words]
+
+                # SBI transaction rows always start with:
+                #   <day> <MonAbbr> [<year>]  <day> <MonAbbr> [<year>]  <desc…>
+                # The year token is present on the first occurrence for that
+                # calendar year; subsequent rows within the same year may omit it.
+                if (
+                    len(texts) < 4
+                    or not texts[0].isdigit()
+                    or texts[1] not in _SBI_MONTHS
+                ):
+                    continue
+
+                # ── Parse transaction date ──────────────────────────────────
+                try:
+                    if len(texts) > 2 and len(texts[2]) == 4 and texts[2].isdigit():
+                        # Year present: "8 Oct 2011  8 Oct 2011  <desc…>"
+                        year = int(texts[2])
+                        last_year = year
+                        desc_start = 6  # skip: day mon year | day mon year
+                    else:
+                        # Year omitted: "15 Nov  15 Nov  <desc…>"
+                        year = last_year if last_year else datetime.now().year
+                        desc_start = 4  # skip: day mon | day mon
+
+                    month = datetime.strptime(texts[1], "%b").month
+                    txn_date = datetime(year, month, int(texts[0]))
+                except (ValueError, IndexError):
+                    continue
+
+                # ── Classify remaining words by x-position ─────────────────
+                description = ""
+                ref_no = ""
+                debit = 0.0
+                credit = 0.0
+                balance = 0.0
+
+                for i in range(desc_start, len(row_words)):
+                    w = row_words[i]
+                    x, t = w["x0"], w["text"]
+
+                    if x < _SBI_DESC_X:  # Description
+                        description += t + " "
+                    elif x < _SBI_REF_X:  # Ref No. / Cheque No.
+                        ref_no += t + " "
+                    elif x < _SBI_DEBIT_X:  # Debit
+                        debit = _sbi_parse_amount(t)
+                    elif x < _SBI_CREDIT_X:  # Credit
+                        credit = _sbi_parse_amount(t)
+                    else:  # Balance
+                        balance = _sbi_parse_amount(t)
+
+                transactions.append(
+                    {
+                        "date": txn_date,
+                        "narration": description.strip(),
+                        "ref_no": ref_no.strip(),
+                        "value_date": "",  # SBI value date is in the date cols; kept empty to match HDFC schema
+                        "debit": debit,
+                        "credit": credit,
+                        "balance": balance,
+                    }
+                )
+
+    df = pd.DataFrame(transactions)
+    return df
