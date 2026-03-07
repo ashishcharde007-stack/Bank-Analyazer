@@ -7,7 +7,7 @@ import io
 import re
 from datetime import datetime
 
-from app.parser import parse_hdfc_pdf, parse_sbi_pdf, parse_axis_pdf
+from app.parser import parse_hdfc_pdf, parse_sbi_pdf
 from app.analyzer import analyze_emi
 
 app = FastAPI(title="Bank Statement Analyzer V1")
@@ -107,53 +107,8 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "hdfc"),
         }
 
-    # ── Axis Bank ─────────────────────────────────────────────────────────────
-    elif bank == "axis":
-
-        def _axis_field(label):
-            m = re.search(label + r"\s*[:\t]+\s*(.+)", raw_text)
-            return m.group(1).strip() if m else ""
-
-        # Account number from statement title line
-        acc_m = re.search(r"Axis Account No\s*[:\s]+(\d+)", raw_text)
-        acc_no = acc_m.group(1).strip() if acc_m else _axis_field("Account No")
-
-        # Statement period
-        period_m = re.search(
-            r"period\s*\(From\s*:\s*([\d\-]+)\s+To\s*:\s*([\d\-]+)\)",
-            raw_text,
-        )
-        from_date = period_m.group(1) if period_m else ""
-        to_date = period_m.group(2) if period_m else ""
-
-        # Account holder name — first non-empty line before "Joint Holder"
-        name = ""
-        lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-        for line in lines:
-            if re.match(r"^[A-Z][A-Z\s]+$", line) and len(line) > 4:
-                name = line.strip()
-                break
-
-        return {
-            "account_holder": name,
-            "bank_name": "Axis Bank",
-            "account_number": acc_no,
-            "masked_account_number": (
-                "- • ••••" + acc_no[-4:] if len(acc_no) >= 4 else acc_no
-            ),
-            "account_type": _axis_field("Scheme"),
-            "ifsc_code": "",
-            "branch": "",
-            "email": "",
-            "phone": "",
-            "customer_id": _axis_field("Customer No"),
-            "account_open_date": "",
-            "od_limit": "",
-            "currency": _axis_field("Currency") or "INR",
-            "from_date": from_date,
-            "to_date": to_date,
-            "period": _compute_period(from_date, to_date, "axis"),
-        }
+    # ── SBI ───────────────────────────────────────────────────────────────────
+    else:
 
         def field(label):
             m = re.search(label + r"\s*[:	]+\s*(.+)", raw_text)
@@ -204,9 +159,6 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
         if fmt == "hdfc":
             d1 = datetime.strptime(from_date, "%d/%m/%Y")
             d2 = datetime.strptime(to_date, "%d/%m/%Y")
-        elif fmt == "axis":
-            d1 = datetime.strptime(from_date, "%d-%m-%Y")
-            d2 = datetime.strptime(to_date, "%d-%m-%Y")
         else:
             d1 = datetime.strptime(from_date, "%d %b %Y")
             d2 = datetime.strptime(to_date, "%d %b %Y")
@@ -533,13 +485,6 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
     if "state bank of india" in text_lower or "sbchq" in text_lower:
         return "sbi"
 
-    if (
-        "axis bank" in text_lower
-        or "axisbank" in text_lower
-        or "axis account" in text_lower
-    ):
-        return "axis"
-
     return "hdfc"
 
 
@@ -553,8 +498,6 @@ def process_statement(contents: bytes, password: str | None = None):
 
     if bank == "sbi":
         df = parse_sbi_pdf(io.BytesIO(contents), password)
-    elif bank == "axis":
-        df = parse_axis_pdf(io.BytesIO(contents), password)
     else:
         df = parse_hdfc_pdf(io.BytesIO(contents), password)
 
