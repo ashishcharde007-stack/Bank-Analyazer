@@ -547,3 +547,250 @@ def parse_axis_pdf(file_stream, password=None):
 
     df = pd.DataFrame(transactions)
     return df
+# ---------------------------------------------------------------------------
+# PNB (Punjab National Bank) Statement Parser
+# ---------------------------------------------------------------------------
+#
+# PNB PDF column x-boundaries (verified from real PDF word coordinates):
+#
+#   Transaction Date : x0   0 – 119   format dd/mm/yyyy
+#   Cheque Number    : x0 120 – 174   (usually empty)
+#   Withdrawal       : x0 175 – 262   debit amounts
+#   Deposit          : x0 263 – 319   credit amounts
+#   Balance          : x0 320 – 369
+#   "Cr." marker     : x0 370 – 393   (always present, ignored)
+#   Narration        : x0 394 +
+#
+# STRUCTURE:
+#   Every transaction occupies exactly 2 PDF rows:
+#     Main row : date | [withdrawal|deposit] | balance | Cr. | narration-part-1
+#     Cont row : narration-part-2  (x=394, no date, no amounts)
+#
+#   Some narrations have 2 continuation rows (e.g. IMPS- / IN/... / U KUM).
+#
+# PASSWORD:
+#   PNB PDFs are encrypted with the 16-digit account number as the password.
+#   The account number is embedded in the PDF title line and is tried
+#   automatically.  If that fails, the caller must supply the password.
+# ---------------------------------------------------------------------------
+
+_P_DATE_END   = 120
+_P_CHQ_END    = 175
+_P_WDRAW_END  = 263
+_P_DEP_END    = 320
+_P_BAL_END    = 370
+_P_CR_END     = 394   # "Cr." marker zone – skip
+_P_NARR_START = 394
+
+_P_SKIP_TEXTS = {
+    "Transaction", "Date", "Cheque", "Number",
+    "Withdrawal", "Deposit", "Balance", "Narration",
+    "Page", "of",
+}
+
+_P_FOOTER_STARTS = (
+    "****", "*", "Unless", "Computer", "Please", "Customers",
+    "Abbreviations",
+)
+
+
+def _pnb_is_date(text):
+    """True if text looks like a PNB date: dd/mm/yyyy."""
+    try:
+        from datetime import datetime
+        datetime.strptime(text, "%d/%m/%Y")
+        return True
+    except ValueError:
+        return False
+
+
+def _pnb_amt(text):
+    """Parse amount string → float. Returns None if not a number."""
+    try:
+        return float(text.replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def _pnb_is_skip_row(texts, x0s):
+    """True for header, footer, page-number or total rows."""
+    if not texts:
+        return True
+    if all(t in _P_SKIP_TEXTS for t in texts):
+        return True
+    if texts[0].startswith(_P_FOOTER_STARTS):
+        return True
+    # Page N of M
+    if texts[0] == "Page" or (len(texts) <= 4 and texts[0].isdigit()):
+        return True
+    return False
+
+
+def _pnb_open(file_stream, password=None):
+    """
+    Open PNB PDF.  PNB encrypts with the 16-digit account number.
+    We extract it from the title line and try it automatically.
+    If a password is explicitly supplied, that takes priority.
+    """
+    import pdfplumber, re, io
+    from fastapi import HTTPException
+
+    raw = file_stream.read()
+    file_stream.seek(0)
+
+    # If explicit password supplied, try it first
+    if password:
+        try:
+            return pdfplumber.open(io.BytesIO(raw), password=password)
+        except Exception:
+            pass
+
+    # Try no password (some PNB exports are unencrypted)
+    try:
+        pdf = pdfplumber.open(io.BytesIO(raw))
+        pdf.pages[0].extract_text()   # force a read to check
+        return pdf
+    except Exception:
+        pass
+
+    # Try to extract account number from raw bytes and use as password
+    m = re.search(rb"Account[:\s]+(\d{10,20})", raw)
+    if m:
+        acc_pwd = m.group(1).decode()
+        try:
+            return pdfplumber.open(io.BytesIO(raw), password=acc_pwd)
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=401, detail={"error": "PASSWORD_REQUIRED"})
+
+
+def parse_pnb_pdf(file_stream, password=None):
+    """
+    Parse a PNB bank statement PDF into a DataFrame with columns:
+        date, narration, debit, credit, balance
+
+    PNB transactions always have:
+      Main row  : date + amount(s) + balance + Cr. + narration-start
+      Cont rows : narration-continuation at x >= 394 (1–2 extra rows typical)
+    """
+    from datetime import datetime as _dt
+    import pandas as pd
+
+    transactions = []
+    pending_narration = ""   # narration buffer from PREVIOUS rows
+
+    pdf = _pnb_open(file_stream, password)
+
+    with pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+
+            rows = {}
+            for w in words:
+                rows.setdefault(round(w["top"], 0), []).append(w)
+
+            for _top, row_words in sorted(rows.items()):
+                row_words = sorted(row_words, key=lambda w: w["x0"])
+                texts = [w["text"] for w in row_words]
+                x0s   = [w["x0"]  for w in row_words]
+
+                # ── Skip header / footer / page-number rows ──────────────
+                if _pnb_is_skip_row(texts, x0s):
+                    continue
+
+                # ── Date row detection ───────────────────────────────────
+                has_date = (x0s[0] < _P_DATE_END and _pnb_is_date(texts[0]))
+
+                if has_date:
+                    try:
+                        txn_date = _dt.strptime(texts[0], "%d/%m/%Y")
+                    except ValueError:
+                        continue
+
+                    debit = credit = balance = 0.0
+                    narration = ""
+
+                    for w in row_words[1:]:
+                        x, t = w["x0"], w["text"]
+                        if x >= _P_NARR_START:
+                            narration += t + " "
+                        elif x >= _P_CR_END:
+                            pass                      # "Cr." marker – skip
+                        elif x >= _P_BAL_END:
+                            pass                      # "Cr." zone – skip
+                        elif x >= _P_DEP_END:
+                            pass                      # should not appear
+                        elif x >= _P_WDRAW_END:
+                            # In balance zone (320–369)
+                            v = _pnb_amt(t)
+                            if v is not None:
+                                balance = v
+                        elif x >= _P_CHQ_END:
+                            # Withdrawal (175–262) OR deposit (263–319)
+                            v = _pnb_amt(t)
+                            if v is not None:
+                                if x < _P_WDRAW_END:
+                                    debit = v
+                                else:
+                                    credit = v
+                        # x < _P_CHQ_END → cheque number zone (skip)
+
+                    # Re-parse more carefully with explicit zone checks
+                    debit = credit = balance = 0.0
+                    narration = ""
+                    for w in row_words[1:]:
+                        x, t = w["x0"], w["text"]
+                        if x >= _P_NARR_START:
+                            narration += t + " "
+                        elif x >= _P_CR_END:
+                            pass                          # "Cr." – skip
+                        elif x >= _P_DEP_END:             # 320–393: balance
+                            v = _pnb_amt(t)
+                            if v is not None:
+                                balance = v
+                        elif x >= _P_WDRAW_END:           # 263–319: deposit
+                            v = _pnb_amt(t)
+                            if v is not None:
+                                credit = v
+                        elif x >= _P_CHQ_END:             # 175–262: withdrawal
+                            v = _pnb_amt(t)
+                            if v is not None:
+                                debit = v
+                        # x < 175: date / cheque – skip
+
+                    transactions.append({
+                        "date":      txn_date,
+                        "narration": narration.strip(),
+                        "debit":     debit,
+                        "credit":    credit,
+                        "balance":   balance,
+                        "_pending":  True,   # may still get continuation rows
+                    })
+                    continue
+
+                # ── Narration continuation row ───────────────────────────
+                # Only text at x >= _P_NARR_START, no date, no amounts
+                if not transactions:
+                    continue
+
+                is_narr_cont = all(x >= _P_NARR_START for x in x0s)
+                if is_narr_cont:
+                    extra = " ".join(texts)
+                    transactions[-1]["narration"] = (
+                        transactions[-1]["narration"] + " " + extra
+                    ).strip()
+
+    # Clean up helper flag and normalise spaces
+    for t in transactions:
+        t.pop("_pending", None)
+        t["narration"] = " ".join(t["narration"].split())
+
+    df = pd.DataFrame(transactions)
+    return df
+
+
+
+
+
+

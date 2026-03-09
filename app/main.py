@@ -7,7 +7,8 @@ import io
 import re
 from datetime import datetime
 
-from app.parser import parse_hdfc_pdf, parse_sbi_pdf, parse_axis_pdf
+# ✅ CHANGE 1: Added parse_pnb_pdf to the import
+from app.parser import parse_hdfc_pdf, parse_sbi_pdf, parse_axis_pdf, parse_pnb_pdf
 from app.analyzer import analyze_emi
 
 app = FastAPI(title="Bank Statement Analyzer V1")
@@ -33,15 +34,27 @@ def extract_account_info(
 ) -> dict:
     """
     Extract account holder metadata from the first page of the PDF.
-    Returns a unified dict for both HDFC and SBI statements.
+    Returns a unified dict for HDFC, SBI, Axis and PNB statements.
     """
-    with pdfplumber.open(io.BytesIO(contents), password=password) as pdf:
-        raw_text = pdf.pages[0].extract_text() or ""
-        words = pdf.pages[0].extract_words()
 
-    rows = {}
-    for w in words:
-        rows.setdefault(round(w["top"], 0), []).append(w)
+    # PNB PDFs are encrypted with the account number as password.
+    # We need to unlock them before reading metadata.
+    if bank == "pnb":
+        from app.parser import _pnb_open
+
+        pdf_obj = _pnb_open(io.BytesIO(contents), password)
+        with pdf_obj as pdf:
+            raw_text = pdf.pages[0].extract_text() or ""
+    else:
+        with pdfplumber.open(io.BytesIO(contents), password=password) as pdf:
+            raw_text = pdf.pages[0].extract_text() or ""
+            words = pdf.pages[0].extract_words()
+
+    # Only HDFC needs word-level coordinate parsing for metadata
+    if bank != "pnb":
+        rows = {}
+        for w in words:
+            rows.setdefault(round(w["top"], 0), []).append(w)
 
     # ── HDFC ──────────────────────────────────────────────────────────────────
     if bank == "hdfc":
@@ -126,7 +139,7 @@ def extract_account_info(
         from_date = period_m.group(1) if period_m else ""
         to_date = period_m.group(2) if period_m else ""
 
-        # Account holder name — first non-empty line before "Joint Holder"
+        # Account holder name — first ALL-CAPS line in the PDF
         name = ""
         lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
         for line in lines:
@@ -155,7 +168,57 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "axis"),
         }
 
-    # ── SBI ───────────────────────────────────────────────────────────────────────────
+    # ✅ CHANGE 2: Added PNB metadata extractor block
+    # ── PNB (Punjab National Bank) ────────────────────────────────────────────
+    elif bank == "pnb":
+
+        # Account number — appears in title line: "Account Statement for the Account: XXXXXXXX"
+        acc_m = re.search(r"Account[:\s]+([\d]{10,20})", raw_text)
+        acc_no = acc_m.group(1).strip() if acc_m else ""
+
+        # Customer name — "Customer Name: LALITA DEVI"
+        name_m = re.search(r"Customer Name[:\s]+(.+)", raw_text)
+        name = name_m.group(1).strip() if name_m else ""
+
+        # Branch name — "Branch Name: NOIDA, JSS ACADEMY SECT-62"
+        branch_m = re.search(r"Branch Name[:\s]+(.+)", raw_text)
+        branch = branch_m.group(1).strip() if branch_m else ""
+
+        # IFSC code — "IFSC Code: PUNB0461300"
+        ifsc_m = re.search(r"IFSC Code[:\s]+([A-Z0-9]+)", raw_text)
+        ifsc = ifsc_m.group(1).strip() if ifsc_m else ""
+
+        # Statement period — "Statement For: 2023/04/27 to 2023/05/12"
+        # We convert yyyy/mm/dd → yyyy-mm-dd for consistent storage
+        period_m = re.search(
+            r"Statement For[:\s]+(\d{4}/\d{2}/\d{2})\s+to\s+(\d{4}/\d{2}/\d{2})",
+            raw_text,
+        )
+        from_date = period_m.group(1).replace("/", "-") if period_m else ""
+        to_date = period_m.group(2).replace("/", "-") if period_m else ""
+
+        return {
+            "account_holder": name,
+            "bank_name": "Punjab National Bank",
+            "account_number": acc_no,
+            "masked_account_number": (
+                "- • ••••" + acc_no[-4:] if len(acc_no) >= 4 else acc_no
+            ),
+            "account_type": "",
+            "ifsc_code": ifsc,
+            "branch": branch,
+            "email": "",
+            "phone": "",
+            "customer_id": "",
+            "account_open_date": "",
+            "od_limit": "",
+            "currency": "INR",
+            "from_date": from_date,
+            "to_date": to_date,
+            "period": _compute_period(from_date, to_date, "pnb"),
+        }
+
+    # ── SBI ───────────────────────────────────────────────────────────────────
     else:
 
         def field(label):
@@ -210,7 +273,12 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
         elif fmt == "axis":
             d1 = datetime.strptime(from_date, "%d-%m-%Y")
             d2 = datetime.strptime(to_date, "%d-%m-%Y")
+        # ✅ CHANGE 3: Added PNB date format (yyyy-mm-dd)
+        elif fmt == "pnb":
+            d1 = datetime.strptime(from_date, "%Y-%m-%d")
+            d2 = datetime.strptime(to_date, "%Y-%m-%d")
         else:
+            # SBI uses "01 Apr 2023" style
             d1 = datetime.strptime(from_date, "%d %b %Y")
             d2 = datetime.strptime(to_date, "%d %b %Y")
         diff = (d2 - d1).days
@@ -235,31 +303,31 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
 #  REGULAR      – Very low activity, few credits, no clear income source
 
 _SALARY_KW = [
-    r"SAL",
-    r"SALARY",
-    r"NETSAL",
-    r"PAYROLL",
-    r"PAYSAL",
-    r"EMPLOYEE",
-    r"EMPLYR",
+    r"SAL",
+    r"SALARY",
+    r"NETSAL",
+    r"PAYROLL",
+    r"PAYSAL",
+    r"EMPLOYEE",
+    r"EMPLYR",
     r"SAL[/_-]\w+",
     r"SALARY.*CREDIT",
     r"CREDIT.*SALARY",
 ]
 
 _BUSINESS_KW = [
-    r"GST",
-    r"TDS",
-    r"INVOICE",
-    r"VENDOR",
-    r"MERCHANT",
-    r"TRADE",
-    r"COMMISSION",
-    r"CONSULTANCY",
-    r"BUSINESS",
-    r"FIRM",
-    r"CASH DEPOSIT",
-    r"CASH DEP",
+    r"GST",
+    r"TDS",
+    r"INVOICE",
+    r"VENDOR",
+    r"MERCHANT",
+    r"TRADE",
+    r"COMMISSION",
+    r"CONSULTANCY",
+    r"BUSINESS",
+    r"FIRM",
+    r"CASH DEPOSIT",
+    r"CASH DEP",
 ]
 
 
@@ -344,7 +412,7 @@ def classify_account_type(df: pd.DataFrame) -> dict:
         )
 
     # ── Signal 5: EMI / SIP / Loan deductions ─────────────────────────────
-    emi_count = narrations.str.contains(r"EMI|SIP|LOAN|ACH", regex=True).sum()
+    emi_count = narrations.str.contains(r"EMI|SIP|LOAN|ACH", regex=True).sum()
     if emi_count >= 3:
         scores["Salaried"] += 8
         signals.append(
@@ -525,6 +593,27 @@ def generate_loan_readiness(summary, monthly_summary):
 
 
 def detect_bank(contents: bytes, password: str | None = None) -> str:
+    """
+    Detect the bank from the first page text of the PDF.
+    PNB PDFs are encrypted — we use _pnb_open() to try the account number
+    as the password automatically before giving up.
+    """
+    # ✅ CHANGE 4: PNB PDFs are password-protected so we try _pnb_open first.
+    # If it succeeds we know it's a PNB PDF (other banks are not encrypted).
+    try:
+        from app.parser import _pnb_open
+
+        with _pnb_open(io.BytesIO(contents), password) as pdf:
+            first_page_text = pdf.pages[0].extract_text() or ""
+        if (
+            "punjab national bank" in first_page_text.lower()
+            or "punb" in first_page_text.lower()
+        ):
+            return "pnb"
+    except Exception:
+        pass  # Not a PNB PDF — fall through to unencrypted detection below
+
+    # Unencrypted banks (HDFC, SBI, Axis)
     try:
         with pdfplumber.open(io.BytesIO(contents), password=password) as pdf:
             first_page_text = pdf.pages[0].extract_text() or ""
@@ -554,10 +643,15 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
 def process_statement(contents: bytes, password: str | None = None):
     bank = detect_bank(contents, password)
 
+    # ✅ CHANGE 5: Added PNB branch to the parser routing
     if bank == "sbi":
         df = parse_sbi_pdf(io.BytesIO(contents), password)
     elif bank == "axis":
         df = parse_axis_pdf(io.BytesIO(contents), password)
+    elif bank == "pnb":
+        # PNB PDFs use the 16-digit account number as the PDF password.
+        # parse_pnb_pdf handles auto-detection of the password internally.
+        df = parse_pnb_pdf(io.BytesIO(contents), password)
     else:
         df = parse_hdfc_pdf(io.BytesIO(contents), password)
 
