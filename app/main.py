@@ -155,6 +155,9 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "axis"),
         }
 
+    # ── SBI ───────────────────────────────────────────────────────────────────────────
+    else:
+
         def field(label):
             m = re.search(label + r"\s*[:	]+\s*(.+)", raw_text)
             return re.sub(r"\(cid:\d+\)", "", m.group(1)).strip() if m else ""
