@@ -8,7 +8,8 @@ import re
 from datetime import datetime
 
 # ✅ CHANGE 1: Added parse_pnb_pdf to the import
-from app.parser import parse_hdfc_pdf, parse_sbi_pdf, parse_axis_pdf, parse_pnb_pdf
+# ✅ UBIN CHANGE 1: Added parse_ubin_pdf to the import
+from app.parser import parse_hdfc_pdf, parse_sbi_pdf, parse_axis_pdf, parse_pnb_pdf, parse_ubin_pdf
 from app.analyzer import analyze_emi
 
 app = FastAPI(title="Bank Statement Analyzer V1")
@@ -218,6 +219,68 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "pnb"),
         }
 
+    # ✅ UBIN CHANGE 2: Added Union Bank of India metadata extractor block
+    # ── Union Bank of India ───────────────────────────────────────────────────
+    elif bank == "ubin":
+
+        # Account number — "Account No  486702010051174"
+        acc_m = re.search(r"Account No\s+(\d+)", raw_text)
+        acc_no = acc_m.group(1).strip() if acc_m else ""
+
+        # Customer name — first ALL-CAPS line at the top of the PDF
+        name = ""
+        lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+        for line in lines:
+            if re.match(r"^[A-Z][A-Z\s]+$", line) and len(line) > 3:
+                name = line.strip()
+                break
+
+        # Branch — "Branch  Rathatla Bazar"
+        branch_m = re.search(r"Branch\s+(.+)", raw_text)
+        branch = branch_m.group(1).strip() if branch_m else ""
+
+        # IFSC code — "IFSC Code  UBIN0548677"
+        ifsc_m = re.search(r"IFSC Code\s+([A-Z0-9]+)", raw_text)
+        ifsc = ifsc_m.group(1).strip() if ifsc_m else ""
+
+        # Account type — "Account Type  Saving Account"
+        atype_m = re.search(r"Account Type\s+(.+)", raw_text)
+        atype = atype_m.group(1).strip() if atype_m else ""
+
+        # Customer ID — "Customer Id  205720372"
+        cust_m = re.search(r"Customer Id\s+(\d+)", raw_text)
+        cust_id = cust_m.group(1).strip() if cust_m else ""
+
+        # Statement period — "Statement Period From -01/01/2024 To 13/06/2024"
+        # The "-" before the from-date is a PDF rendering artifact, made optional
+        period_m = re.search(
+            r"Statement Period From\s*-?(\d{2}/\d{2}/\d{4})\s+To\s+(\d{2}/\d{2}/\d{4})",
+            raw_text,
+        )
+        from_date = period_m.group(1) if period_m else ""
+        to_date   = period_m.group(2) if period_m else ""
+
+        return {
+            "account_holder":        name,
+            "bank_name":             "Union Bank of India",
+            "account_number":        acc_no,
+            "masked_account_number": (
+                "- • ••••" + acc_no[-4:] if len(acc_no) >= 4 else acc_no
+            ),
+            "account_type":          atype,
+            "ifsc_code":             ifsc,
+            "branch":                branch,
+            "email":                 "",
+            "phone":                 "",
+            "customer_id":           cust_id,
+            "account_open_date":     "",
+            "od_limit":              "",
+            "currency":              "INR",
+            "from_date":             from_date,
+            "to_date":               to_date,
+            "period":                _compute_period(from_date, to_date, "ubin"),
+        }
+
     # ── SBI ───────────────────────────────────────────────────────────────────
     else:
 
@@ -277,6 +340,10 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
         elif fmt == "pnb":
             d1 = datetime.strptime(from_date, "%Y-%m-%d")
             d2 = datetime.strptime(to_date, "%Y-%m-%d")
+        # ✅ UBIN CHANGE 3: Added Union Bank date format (dd/mm/yyyy)
+        elif fmt == "ubin":
+            d1 = datetime.strptime(from_date, "%d/%m/%Y")
+            d2 = datetime.strptime(to_date, "%d/%m/%Y")
         else:
             # SBI uses "01 Apr 2023" style
             d1 = datetime.strptime(from_date, "%d %b %Y")
@@ -632,6 +699,14 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
     ):
         return "axis"
 
+    # ✅ UBIN CHANGE 4: Union Bank detection
+    # NOTE: We check for "union bank" text OR the standalone word "ubin" (as a bank identifier).
+    # We must NOT use a plain substring match like "ubin" in text because HDFC narrations
+    # often contain IFSC codes like "NEFTDR-UBIN0539686-..." which would cause a false match.
+    # Instead we check for "union bank" phrase OR "ubin" only as a standalone word boundary match.
+    if "union bank" in text_lower or re.search(r"\bubin\b", text_lower):
+        return "ubin"
+
     return "hdfc"
 
 
@@ -652,6 +727,9 @@ def process_statement(contents: bytes, password: str | None = None):
         # PNB PDFs use the 16-digit account number as the PDF password.
         # parse_pnb_pdf handles auto-detection of the password internally.
         df = parse_pnb_pdf(io.BytesIO(contents), password)
+    # ✅ UBIN CHANGE 5: Route Union Bank PDFs to parse_ubin_pdf
+    elif bank == "ubin":
+        df = parse_ubin_pdf(io.BytesIO(contents), password)
     else:
         df = parse_hdfc_pdf(io.BytesIO(contents), password)
 
@@ -769,3 +847,5 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=analysis.xlsx"},
     )
+
+

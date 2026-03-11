@@ -1037,3 +1037,187 @@ def parse_ubin_pdf(file_stream, password=None):
 
     df = pd.DataFrame(transactions)
     return df
+
+
+# ---------------------------------------------------------------------------
+# IDBI Bank Statement Parser
+# ---------------------------------------------------------------------------
+#
+# IDBI Bank PDF column x-boundaries (verified from real PDF word coordinates):
+#
+#   Srl          : x0  51 –  67   serial number (integer)
+#   Txn Date     : x0  68 – 104   format dd/mm/yyyy
+#   Time         : x0 105 – 157   HH:MM:SS + AM/PM tokens  → ignored
+#   Value Date   : x0 158 – 209   format dd/mm/yyyy
+#   Description  : x0 210 – 453   narration (may span multiple space-separated tokens)
+#   CR/DR        : x0 454 – 481   "Dr." or "Cr."
+#   CCY          : x0 482 – 517   always "INR"              → ignored
+#   Amount       : x0 518 – 587
+#   Balance      : x0 588 +
+#
+# STRUCTURE:
+#   Every transaction fits on exactly one PDF row.
+#   Row starts with an integer serial number, followed by the transaction date.
+#   The CR/DR column ("Dr." / "Cr.") determines debit vs credit direction.
+#   No multi-row narration continuation — all description tokens sit in
+#   x0 210–453 on the same row.
+#
+# ---------------------------------------------------------------------------
+
+_I_SRL_END = 67  # serial number ends here
+_I_DATE_END = 105  # txn date ends here (time tokens follow)
+_I_TIME_END = 210  # time + value-date zone ends here
+_I_DESC_END = 454  # description zone ends here
+_I_CRDR_END = 482  # CR/DR marker ends here
+_I_CCY_END = 518  # CCY column ends here ("INR")
+_I_AMT_END = 588  # amount ends here; balance follows
+
+# First-token values that indicate header / footer / summary rows to skip
+_I_SKIP_FIRST = {
+    "Srl",
+    "Page",
+    "IDBI",
+    "Our",
+    "Important",
+    "Contents",
+    "debit,",
+    "DO",
+    "reason.",
+    "ask",
+    "Service",
+    "This",
+    "Statement",
+    "Dr",
+    "Debits",
+    "Credits",
+    "Transaction",
+    "YOUR",
+    "A/C",
+    "Status",
+    "*",
+}
+
+
+def _idbi_is_date(text):
+    """True if text looks like an IDBI date: dd/mm/yyyy."""
+    try:
+        from datetime import datetime
+
+        datetime.strptime(text, "%d/%m/%Y")
+        return True
+    except ValueError:
+        return False
+
+
+def _idbi_amt(text):
+    """Parse amount string (may have commas) → float. Returns None if not a number."""
+    try:
+        return float(text.replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def parse_idbi_pdf(file_stream, password=None):
+    """
+    Parse an IDBI Bank statement PDF into a DataFrame with columns:
+        date, narration, value_date, debit, credit, balance
+
+    Each transaction occupies exactly one PDF row:
+        srl | txn_date | time | am_pm | value_date | description | CR/DR | INR | amount | balance
+
+    The CR/DR column ("Dr." or "Cr.") drives the debit/credit split.
+    """
+    from datetime import datetime as _dt
+    import pandas as pd
+    import pdfplumber
+    from fastapi import HTTPException
+
+    transactions = []
+
+    try:
+        pdf = pdfplumber.open(file_stream, password=password)
+    except Exception:
+        raise HTTPException(status_code=401, detail={"error": "PASSWORD_REQUIRED"})
+
+    with pdf:
+        for page in pdf.pages:
+            words = page.extract_words()
+
+            # Group words into logical rows by y-position
+            rows = {}
+            for w in words:
+                rows.setdefault(round(w["top"], 0), []).append(w)
+
+            for _top, row_words in sorted(rows.items()):
+                row_words = sorted(row_words, key=lambda w: w["x0"])
+                texts = [w["text"] for w in row_words]
+                x0s = [w["x0"] for w in row_words]
+
+                if not texts:
+                    continue
+
+                # ── Skip header / footer / summary rows ──────────────────
+                # Transaction rows always start with an integer serial number
+                # immediately followed by a dd/mm/yyyy date.
+                if texts[0] in _I_SKIP_FIRST:
+                    continue
+                if not texts[0].isdigit():
+                    continue
+                if len(texts) < 2 or not _idbi_is_date(texts[1]):
+                    continue
+
+                # ── Parse transaction row ────────────────────────────────
+                try:
+                    txn_date = _dt.strptime(texts[1], "%d/%m/%Y")
+                except ValueError:
+                    continue
+
+                desc = ""
+                value_date = ""
+                cr_dr = ""
+                amount = 0.0
+                balance = 0.0
+
+                for w in row_words[2:]:  # skip srl + txn_date tokens
+                    x, t = w["x0"], w["text"]
+
+                    if x >= _I_AMT_END:  # Balance column
+                        v = _idbi_amt(t)
+                        if v is not None:
+                            balance = v
+
+                    elif x >= _I_CCY_END:  # Amount column
+                        v = _idbi_amt(t)
+                        if v is not None:
+                            amount = v
+
+                    elif x >= _I_CRDR_END:  # CCY column ("INR") → skip
+                        pass
+
+                    elif x >= _I_DESC_END:  # CR/DR column ("Dr." or "Cr.")
+                        cr_dr = t
+
+                    elif x >= _I_TIME_END:  # Description zone (x 210–453)
+                        desc += t + " "
+
+                    else:  # Time / AM-PM / Value Date zone
+                        if _idbi_is_date(t):
+                            value_date = t
+                        # HH:MM:SS, AM, PM tokens are silently skipped
+
+                debit = amount if cr_dr == "Dr." else 0.0
+                credit = amount if cr_dr == "Cr." else 0.0
+
+                transactions.append(
+                    {
+                        "date": txn_date,
+                        "narration": " ".join(desc.split()),  # normalise spaces
+                        "value_date": value_date,
+                        "debit": debit,
+                        "credit": credit,
+                        "balance": balance,
+                    }
+                )
+
+    df = pd.DataFrame(transactions)
+    return df
