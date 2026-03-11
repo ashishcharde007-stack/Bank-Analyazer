@@ -699,8 +699,12 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
     ):
         return "axis"
 
-    # ✅ UBIN CHANGE 4: Union Bank detection — checks "union bank" text or IFSC prefix "ubin"
-    if "union bank" in text_lower or "ubin" in text_lower:
+    # ✅ UBIN CHANGE 4: Union Bank detection
+    # NOTE: We check for "union bank" text OR the standalone word "ubin" (as a bank identifier).
+    # We must NOT use a plain substring match like "ubin" in text because HDFC narrations
+    # often contain IFSC codes like "NEFTDR-UBIN0539686-..." which would cause a false match.
+    # Instead we check for "union bank" phrase OR "ubin" only as a standalone word boundary match.
+    if "union bank" in text_lower or re.search(r"\bubin\b", text_lower):
         return "ubin"
 
     return "hdfc"
