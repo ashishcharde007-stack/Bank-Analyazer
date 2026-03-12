@@ -888,7 +888,7 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
 
 # -------------------------------
 # 🏦 TALLY XML DOWNLOAD API
-# -------------------------------
+# ------------------------------
 
 
 def generate_tally_xml(df, account_info, summary) -> str:
