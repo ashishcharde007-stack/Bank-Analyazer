@@ -332,10 +332,11 @@ def generate_category_summary(df: pd.DataFrame) -> dict:
     # ── Transactions grouped by category ─────────────────────────────────
     txn_df = df[["date", "narration", "debit", "credit", "category"]].copy()
     txn_df["date"] = txn_df["date"].dt.strftime("%d-%m-%Y")
+# ✅ NEW
     transactions_by_category = (
-        txn_df.groupby("category")
-        .apply(lambda x: x.drop("category", axis=1).to_dict(orient="records"))
-        .to_dict()
+    txn_df.groupby("category", group_keys=False)
+    .apply(lambda x: x.to_dict(orient="records"))
+    .to_dict()
     )
 
     return {
