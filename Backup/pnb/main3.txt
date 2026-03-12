@@ -7,9 +7,15 @@ import io
 import re
 from datetime import datetime
 
-# ✅ CHANGE 1: Added parse_pnb_pdf to the import
-# ✅ UBIN CHANGE 1: Added parse_ubin_pdf to the import
-from app.parser import parse_hdfc_pdf, parse_sbi_pdf, parse_axis_pdf, parse_pnb_pdf, parse_ubin_pdf
+# ✅ IDBI CHANGE 1: Added parse_idbi_pdf to the import
+from app.parser import (
+    parse_hdfc_pdf,
+    parse_sbi_pdf,
+    parse_axis_pdf,
+    parse_pnb_pdf,
+    parse_ubin_pdf,
+    parse_idbi_pdf,
+)
 from app.analyzer import analyze_emi
 
 app = FastAPI(title="Bank Statement Analyzer V1")
@@ -35,11 +41,10 @@ def extract_account_info(
 ) -> dict:
     """
     Extract account holder metadata from the first page of the PDF.
-    Returns a unified dict for HDFC, SBI, Axis and PNB statements.
+    Returns a unified dict for HDFC, SBI, Axis, PNB, UBIN and IDBI statements.
     """
 
     # PNB PDFs are encrypted with the account number as password.
-    # We need to unlock them before reading metadata.
     if bank == "pnb":
         from app.parser import _pnb_open
 
@@ -52,7 +57,7 @@ def extract_account_info(
             words = pdf.pages[0].extract_words()
 
     # Only HDFC needs word-level coordinate parsing for metadata
-    if bank != "pnb":
+    if bank not in ("pnb", "idbi"):
         rows = {}
         for w in words:
             rows.setdefault(round(w["top"], 0), []).append(w)
@@ -94,7 +99,6 @@ def extract_account_info(
                 if key and val:
                     meta[key] = val
 
-        # IFSC is merged into one word in extract_words — parse from raw text
         m = re.search(r"RTGS/NEFTIFSC:\s*(\w+)", raw_text)
         ifsc = m.group(1) if m else ""
 
@@ -128,11 +132,9 @@ def extract_account_info(
             m = re.search(label + r"\s*[:\t]+\s*(.+)", raw_text)
             return m.group(1).strip() if m else ""
 
-        # Account number from statement title line
         acc_m = re.search(r"Axis Account No\s*[:\s]+(\d+)", raw_text)
         acc_no = acc_m.group(1).strip() if acc_m else _axis_field("Account No")
 
-        # Statement period
         period_m = re.search(
             r"period\s*\(From\s*:\s*([\d\-]+)\s+To\s*:\s*([\d\-]+)\)",
             raw_text,
@@ -140,7 +142,6 @@ def extract_account_info(
         from_date = period_m.group(1) if period_m else ""
         to_date = period_m.group(2) if period_m else ""
 
-        # Account holder name — first ALL-CAPS line in the PDF
         name = ""
         lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
         for line in lines:
@@ -169,28 +170,21 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "axis"),
         }
 
-    # ✅ CHANGE 2: Added PNB metadata extractor block
     # ── PNB (Punjab National Bank) ────────────────────────────────────────────
     elif bank == "pnb":
 
-        # Account number — appears in title line: "Account Statement for the Account: XXXXXXXX"
         acc_m = re.search(r"Account[:\s]+([\d]{10,20})", raw_text)
         acc_no = acc_m.group(1).strip() if acc_m else ""
 
-        # Customer name — "Customer Name: LALITA DEVI"
         name_m = re.search(r"Customer Name[:\s]+(.+)", raw_text)
         name = name_m.group(1).strip() if name_m else ""
 
-        # Branch name — "Branch Name: NOIDA, JSS ACADEMY SECT-62"
         branch_m = re.search(r"Branch Name[:\s]+(.+)", raw_text)
         branch = branch_m.group(1).strip() if branch_m else ""
 
-        # IFSC code — "IFSC Code: PUNB0461300"
         ifsc_m = re.search(r"IFSC Code[:\s]+([A-Z0-9]+)", raw_text)
         ifsc = ifsc_m.group(1).strip() if ifsc_m else ""
 
-        # Statement period — "Statement For: 2023/04/27 to 2023/05/12"
-        # We convert yyyy/mm/dd → yyyy-mm-dd for consistent storage
         period_m = re.search(
             r"Statement For[:\s]+(\d{4}/\d{2}/\d{2})\s+to\s+(\d{4}/\d{2}/\d{2})",
             raw_text,
@@ -219,15 +213,12 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "pnb"),
         }
 
-    # ✅ UBIN CHANGE 2: Added Union Bank of India metadata extractor block
     # ── Union Bank of India ───────────────────────────────────────────────────
     elif bank == "ubin":
 
-        # Account number — "Account No  486702010051174"
         acc_m = re.search(r"Account No\s+(\d+)", raw_text)
         acc_no = acc_m.group(1).strip() if acc_m else ""
 
-        # Customer name — first ALL-CAPS line at the top of the PDF
         name = ""
         lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
         for line in lines:
@@ -235,50 +226,101 @@ def extract_account_info(
                 name = line.strip()
                 break
 
-        # Branch — "Branch  Rathatla Bazar"
         branch_m = re.search(r"Branch\s+(.+)", raw_text)
         branch = branch_m.group(1).strip() if branch_m else ""
 
-        # IFSC code — "IFSC Code  UBIN0548677"
         ifsc_m = re.search(r"IFSC Code\s+([A-Z0-9]+)", raw_text)
         ifsc = ifsc_m.group(1).strip() if ifsc_m else ""
 
-        # Account type — "Account Type  Saving Account"
         atype_m = re.search(r"Account Type\s+(.+)", raw_text)
         atype = atype_m.group(1).strip() if atype_m else ""
 
-        # Customer ID — "Customer Id  205720372"
         cust_m = re.search(r"Customer Id\s+(\d+)", raw_text)
         cust_id = cust_m.group(1).strip() if cust_m else ""
 
-        # Statement period — "Statement Period From -01/01/2024 To 13/06/2024"
-        # The "-" before the from-date is a PDF rendering artifact, made optional
         period_m = re.search(
             r"Statement Period From\s*-?(\d{2}/\d{2}/\d{4})\s+To\s+(\d{2}/\d{2}/\d{4})",
             raw_text,
         )
         from_date = period_m.group(1) if period_m else ""
-        to_date   = period_m.group(2) if period_m else ""
+        to_date = period_m.group(2) if period_m else ""
 
         return {
-            "account_holder":        name,
-            "bank_name":             "Union Bank of India",
-            "account_number":        acc_no,
+            "account_holder": name,
+            "bank_name": "Union Bank of India",
+            "account_number": acc_no,
             "masked_account_number": (
                 "- • ••••" + acc_no[-4:] if len(acc_no) >= 4 else acc_no
             ),
-            "account_type":          atype,
-            "ifsc_code":             ifsc,
-            "branch":                branch,
-            "email":                 "",
-            "phone":                 "",
-            "customer_id":           cust_id,
-            "account_open_date":     "",
-            "od_limit":              "",
-            "currency":              "INR",
-            "from_date":             from_date,
-            "to_date":               to_date,
-            "period":                _compute_period(from_date, to_date, "ubin"),
+            "account_type": atype,
+            "ifsc_code": ifsc,
+            "branch": branch,
+            "email": "",
+            "phone": "",
+            "customer_id": cust_id,
+            "account_open_date": "",
+            "od_limit": "",
+            "currency": "INR",
+            "from_date": from_date,
+            "to_date": to_date,
+            "period": _compute_period(from_date, to_date, "ubin"),
+        }
+
+    # ✅ IDBI CHANGE 2: IDBI Bank metadata extractor
+    # ── IDBI Bank ─────────────────────────────────────────────────────────────
+    #
+    # IDBI statement header fields (from raw_text):
+    #   Primary Account Holder Name : KAMALESH SUBHASH INAMDAR
+    #   Account No                  : 1357102000000198
+    #   Customer ID                 : 79323863
+    #   Account Branch              : Narhe-Pune (Sol -1357)
+    #   Transaction Date From       : 01/04/2020  to: 31/03/2021
+    #
+    elif bank == "idbi":
+
+        # Account holder name — "Primary Account Holder Name : NAME"
+        name_m = re.search(r"Primary Account Holder Name\s*[:\t]+\s*(.+)", raw_text)
+        name = name_m.group(1).strip() if name_m else ""
+
+        # Account number — "Account No : 1357102000000198"
+        acc_m = re.search(r"Account No\s*[:\t]+\s*(\d+)", raw_text)
+        acc_no = acc_m.group(1).strip() if acc_m else ""
+
+        # Customer ID — "Customer ID : 79323863"
+        cust_m = re.search(r"Customer ID\s*[:\t]+\s*(\d+)", raw_text)
+        cust_id = cust_m.group(1).strip() if cust_m else ""
+
+        # Branch — "Account Branch : Narhe-Pune (Sol -1357)"
+        branch_m = re.search(r"Account Branch\s*[:\t]+\s*(.+)", raw_text)
+        branch = branch_m.group(1).strip() if branch_m else ""
+
+        # Statement period — "Transaction Date From : 01/04/2020  to: 31/03/2021"
+        period_m = re.search(
+            r"Transaction Date From\s*[:\t]+\s*(\d{2}/\d{2}/\d{4})\s+to:\s*(\d{2}/\d{2}/\d{4})",
+            raw_text,
+        )
+        from_date = period_m.group(1) if period_m else ""
+        to_date = period_m.group(2) if period_m else ""
+
+        return {
+            "account_holder": name,
+            "bank_name": "IDBI Bank",
+            "account_number": acc_no,
+            "masked_account_number": (
+                "- • ••••" + acc_no[-4:] if len(acc_no) >= 4 else acc_no
+            ),
+            "account_type": "",
+            "ifsc_code": "",
+            "branch": branch,
+            "email": "",
+            "phone": "",
+            "customer_id": cust_id,
+            "account_open_date": "",
+            "od_limit": "",
+            "currency": "INR",
+            "from_date": from_date,
+            "to_date": to_date,
+            "period": _compute_period(from_date, to_date, "idbi"),
         }
 
     # ── SBI ───────────────────────────────────────────────────────────────────
@@ -330,17 +372,16 @@ def extract_account_info(
 def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
     """Return a human-readable period string like 4mo (11d)."""
     try:
-        if fmt == "hdfc":
+        if fmt in ("hdfc", "idbi"):
+            # ✅ IDBI CHANGE 3: IDBI uses dd/mm/yyyy — same as HDFC
             d1 = datetime.strptime(from_date, "%d/%m/%Y")
             d2 = datetime.strptime(to_date, "%d/%m/%Y")
         elif fmt == "axis":
             d1 = datetime.strptime(from_date, "%d-%m-%Y")
             d2 = datetime.strptime(to_date, "%d-%m-%Y")
-        # ✅ CHANGE 3: Added PNB date format (yyyy-mm-dd)
         elif fmt == "pnb":
             d1 = datetime.strptime(from_date, "%Y-%m-%d")
             d2 = datetime.strptime(to_date, "%Y-%m-%d")
-        # ✅ UBIN CHANGE 3: Added Union Bank date format (dd/mm/yyyy)
         elif fmt == "ubin":
             d1 = datetime.strptime(from_date, "%d/%m/%Y")
             d2 = datetime.strptime(to_date, "%d/%m/%Y")
@@ -359,15 +400,6 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
 # -------------------------------
 # 🧠 ACCOUNT TYPE CLASSIFIER
 # -------------------------------
-#
-# Classification logic based on 10 transaction signals:
-#
-#  SALARIED     – Fixed monthly credit, salary keywords, 25th-5th window,
-#                 1-2 credits/month, regular EMI/SIP deductions
-#  BUSINESS     – Many credits/day, high txn volume (20+/month), business
-#                 keywords (GST/TDS/VENDOR), large cash deposits, round-tripping
-#  NON-SALARIED – 2-5 varied credits/month, no salary pattern, project-based
-#  REGULAR      – Very low activity, few credits, no clear income source
 
 _SALARY_KW = [
     r"SAL",
@@ -662,11 +694,9 @@ def generate_loan_readiness(summary, monthly_summary):
 def detect_bank(contents: bytes, password: str | None = None) -> str:
     """
     Detect the bank from the first page text of the PDF.
-    PNB PDFs are encrypted — we use _pnb_open() to try the account number
-    as the password automatically before giving up.
+    Returns one of: "hdfc", "sbi", "axis", "pnb", "ubin", "idbi"
     """
-    # ✅ CHANGE 4: PNB PDFs are password-protected so we try _pnb_open first.
-    # If it succeeds we know it's a PNB PDF (other banks are not encrypted).
+    # PNB PDFs are password-protected — try _pnb_open first
     try:
         from app.parser import _pnb_open
 
@@ -678,9 +708,9 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
         ):
             return "pnb"
     except Exception:
-        pass  # Not a PNB PDF — fall through to unencrypted detection below
+        pass  # Not a PNB PDF — fall through to unencrypted detection
 
-    # Unencrypted banks (HDFC, SBI, Axis)
+    # Unencrypted banks
     try:
         with pdfplumber.open(io.BytesIO(contents), password=password) as pdf:
             first_page_text = pdf.pages[0].extract_text() or ""
@@ -699,13 +729,18 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
     ):
         return "axis"
 
-    # ✅ UBIN CHANGE 4: Union Bank detection
-    # NOTE: We check for "union bank" text OR the standalone word "ubin" (as a bank identifier).
-    # We must NOT use a plain substring match like "ubin" in text because HDFC narrations
-    # often contain IFSC codes like "NEFTDR-UBIN0539686-..." which would cause a false match.
-    # Instead we check for "union bank" phrase OR "ubin" only as a standalone word boundary match.
     if "union bank" in text_lower or re.search(r"\bubin\b", text_lower):
         return "ubin"
+
+    # ✅ IDBI CHANGE 4: Detect IDBI Bank
+    # We check for "idbi bank" phrase OR the IDBI website / toll-free marker
+    # that appears on every page footer of their statements.
+    if (
+        "idbi bank" in text_lower
+        or "idbi tower" in text_lower
+        or "www.idbi.com" in text_lower
+    ):
+        return "idbi"
 
     return "hdfc"
 
@@ -718,18 +753,17 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
 def process_statement(contents: bytes, password: str | None = None):
     bank = detect_bank(contents, password)
 
-    # ✅ CHANGE 5: Added PNB branch to the parser routing
     if bank == "sbi":
         df = parse_sbi_pdf(io.BytesIO(contents), password)
     elif bank == "axis":
         df = parse_axis_pdf(io.BytesIO(contents), password)
     elif bank == "pnb":
-        # PNB PDFs use the 16-digit account number as the PDF password.
-        # parse_pnb_pdf handles auto-detection of the password internally.
         df = parse_pnb_pdf(io.BytesIO(contents), password)
-    # ✅ UBIN CHANGE 5: Route Union Bank PDFs to parse_ubin_pdf
     elif bank == "ubin":
         df = parse_ubin_pdf(io.BytesIO(contents), password)
+    # ✅ IDBI CHANGE 5: Route IDBI PDFs to parse_idbi_pdf
+    elif bank == "idbi":
+        df = parse_idbi_pdf(io.BytesIO(contents), password)
     else:
         df = parse_hdfc_pdf(io.BytesIO(contents), password)
 
@@ -849,3 +883,118 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
     )
 
 
+# -------------------------------
+# 🏦 TALLY XML DOWNLOAD API
+# -------------------------------
+
+
+def generate_tally_xml(df, account_info, summary) -> str:
+    """
+    Generate Tally Prime compatible XML (TallyXML format).
+    Each transaction becomes a Payment or Receipt voucher.
+    """
+    bank_ledger = account_info.get("bank_name", "Bank Account")
+    account_holder = account_info.get("account_holder", "")
+
+    vouchers_xml = ""
+
+    for _, row in df.iterrows():
+        try:
+            date_obj = pd.to_datetime(row["date"])
+            tally_date = date_obj.strftime("%Y%m%d")  # Tally uses YYYYMMDD
+        except Exception:
+            continue
+
+        narration = (
+            str(row.get("narration", ""))
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        credit = float(row.get("credit", 0) or 0)
+        debit = float(row.get("debit", 0) or 0)
+
+        if credit > 0:
+            # Money IN → Receipt Voucher
+            vouchers_xml += f"""
+    <VOUCHER VCHTYPE="Receipt" ACTION="Create">
+        <DATE>{tally_date}</DATE>
+        <NARRATION>{narration}</NARRATION>
+        <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>{bank_ledger}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{round(credit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>Cash-in-Hand</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+            <AMOUNT>{round(credit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+    </VOUCHER>"""
+
+        elif debit > 0:
+            # Money OUT → Payment Voucher
+            vouchers_xml += f"""
+    <VOUCHER VCHTYPE="Payment" ACTION="Create">
+        <DATE>{tally_date}</DATE>
+        <NARRATION>{narration}</NARRATION>
+        <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>Cash-in-Hand</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{round(debit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>{bank_ledger}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+            <AMOUNT>{round(debit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+    </VOUCHER>"""
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>Vouchers</REPORTNAME>
+                <STATICVARIABLES>
+                    <SVCURRENTCOMPANY>{account_holder}</SVCURRENTCOMPANY>
+                </STATICVARIABLES>
+            </REQUESTDESC>
+            <REQUESTDATA>
+                <TALLYMESSAGE xmlns:UDF="TallyUDF">
+                    {vouchers_xml}
+                </TALLYMESSAGE>
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>"""
+
+    return xml
+
+
+@app.post("/download-tally-xml")
+async def download_tally_xml(file: UploadFile = File(...), password: str = Form(None)):
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(400, "File too large.")
+
+    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
+        process_statement(contents, password)
+    )
+
+    xml_content = generate_tally_xml(df, account_info, summary)
+
+    filename = (
+        f"tally_{account_info.get('bank_name', 'bank').lower().replace(' ', '_')}.xml"
+    )
+
+    return StreamingResponse(
+        io.BytesIO(xml_content.encode("utf-8")),
+        media_type="application/xml",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )

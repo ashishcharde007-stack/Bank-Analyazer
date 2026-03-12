@@ -18,6 +18,9 @@ from app.parser import (
 )
 from app.analyzer import analyze_emi
 
+# ✅ CATEGORIZER: Import categorization functions
+from app.categorizer import add_categories, generate_category_summary
+
 app = FastAPI(title="Bank Statement Analyzer V1")
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
@@ -268,35 +271,20 @@ def extract_account_info(
 
     # ✅ IDBI CHANGE 2: IDBI Bank metadata extractor
     # ── IDBI Bank ─────────────────────────────────────────────────────────────
-    #
-    # IDBI statement header fields (from raw_text):
-    #   Primary Account Holder Name : KAMALESH SUBHASH INAMDAR
-    #   Account No                  : 1357102000000198
-    #   Customer ID                 : 79323863
-    #   Account Branch              : Narhe-Pune (Sol -1357)
-    #   Transaction Date From       : 01/04/2020  to: 31/03/2021
-    #
     elif bank == "idbi":
 
-        # Account holder name — "Primary Account Holder Name : NAME"
-        name_m = re.search(
-            r"Primary Account Holder Name\s*[:\t]+\s*(.+)", raw_text
-        )
+        name_m = re.search(r"Primary Account Holder Name\s*[:\t]+\s*(.+)", raw_text)
         name = name_m.group(1).strip() if name_m else ""
 
-        # Account number — "Account No : 1357102000000198"
         acc_m = re.search(r"Account No\s*[:\t]+\s*(\d+)", raw_text)
         acc_no = acc_m.group(1).strip() if acc_m else ""
 
-        # Customer ID — "Customer ID : 79323863"
         cust_m = re.search(r"Customer ID\s*[:\t]+\s*(\d+)", raw_text)
         cust_id = cust_m.group(1).strip() if cust_m else ""
 
-        # Branch — "Account Branch : Narhe-Pune (Sol -1357)"
         branch_m = re.search(r"Account Branch\s*[:\t]+\s*(.+)", raw_text)
         branch = branch_m.group(1).strip() if branch_m else ""
 
-        # Statement period — "Transaction Date From : 01/04/2020  to: 31/03/2021"
         period_m = re.search(
             r"Transaction Date From\s*[:\t]+\s*(\d{2}/\d{2}/\d{4})\s+to:\s*(\d{2}/\d{2}/\d{4})",
             raw_text,
@@ -375,7 +363,6 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
     """Return a human-readable period string like 4mo (11d)."""
     try:
         if fmt in ("hdfc", "idbi"):
-            # ✅ IDBI CHANGE 3: IDBI uses dd/mm/yyyy — same as HDFC
             d1 = datetime.strptime(from_date, "%d/%m/%Y")
             d2 = datetime.strptime(to_date, "%d/%m/%Y")
         elif fmt == "axis":
@@ -735,8 +722,6 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
         return "ubin"
 
     # ✅ IDBI CHANGE 4: Detect IDBI Bank
-    # We check for "idbi bank" phrase OR the IDBI website / toll-free marker
-    # that appears on every page footer of their statements.
     if (
         "idbi bank" in text_lower
         or "idbi tower" in text_lower
@@ -773,6 +758,9 @@ def process_statement(contents: bytes, password: str | None = None):
         raise HTTPException(400, "No transactions detected.")
 
     df = df.sort_values(["date"]).reset_index(drop=True)
+
+    # ✅ CATEGORIZER: Add category column to every transaction
+    df = add_categories(df)
 
     first = df.iloc[0]
     last = df.iloc[-1]
@@ -831,12 +819,16 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
 
     summary["total_transactions"] = len(df)
 
+    # ✅ CATEGORIZER: Generate category breakdown for the response
+    category_summary = generate_category_summary(df)
+
     return {
         "account_info": account_info,
         "summary": summary,
         "loan_analysis": loan_metrics,
         "monthly_summary": monthly_summary.to_dict(orient="records"),
         "emi_analysis": emi_analysis,
+        "category_summary": category_summary,
         "total_transactions": len(df),
     }
 
@@ -877,9 +869,135 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
             emi_analysis["emi_summary"].items(), columns=["Metric", "Value"]
         ).to_excel(writer, index=False, sheet_name="EMI Analysis")
 
+        # ✅ CATEGORIZER: Add Category Summary sheet to Excel
+        category_summary = generate_category_summary(df)
+        pd.DataFrame(category_summary["expense_by_category"]).to_excel(
+            writer, index=False, sheet_name="Expense by Category"
+        )
+        pd.DataFrame(category_summary["income_by_category"]).to_excel(
+            writer, index=False, sheet_name="Income by Category"
+        )
+
     output.seek(0)
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=analysis.xlsx"},
+    )
+
+
+# -------------------------------
+# 🏦 TALLY XML DOWNLOAD API
+# -------------------------------
+
+
+def generate_tally_xml(df, account_info, summary) -> str:
+    """
+    Generate Tally Prime compatible XML (TallyXML format).
+    Each transaction becomes a Payment or Receipt voucher.
+    """
+    bank_ledger = account_info.get("bank_name", "Bank Account")
+    account_holder = account_info.get("account_holder", "")
+
+    vouchers_xml = ""
+
+    for _, row in df.iterrows():
+        try:
+            date_obj = pd.to_datetime(row["date"])
+            tally_date = date_obj.strftime("%Y%m%d")  # Tally uses YYYYMMDD
+        except Exception:
+            continue
+
+        narration = (
+            str(row.get("narration", ""))
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        credit = float(row.get("credit", 0) or 0)
+        debit = float(row.get("debit", 0) or 0)
+
+        if credit > 0:
+            # Money IN → Receipt Voucher
+            vouchers_xml += f"""
+    <VOUCHER VCHTYPE="Receipt" ACTION="Create">
+        <DATE>{tally_date}</DATE>
+        <NARRATION>{narration}</NARRATION>
+        <VOUCHERTYPENAME>Receipt</VOUCHERTYPENAME>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>{bank_ledger}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{round(credit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>Cash-in-Hand</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+            <AMOUNT>{round(credit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+    </VOUCHER>"""
+
+        elif debit > 0:
+            # Money OUT → Payment Voucher
+            vouchers_xml += f"""
+    <VOUCHER VCHTYPE="Payment" ACTION="Create">
+        <DATE>{tally_date}</DATE>
+        <NARRATION>{narration}</NARRATION>
+        <VOUCHERTYPENAME>Payment</VOUCHERTYPENAME>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>Cash-in-Hand</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+            <AMOUNT>-{round(debit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+        <ALLLEDGERENTRIES.LIST>
+            <LEDGERNAME>{bank_ledger}</LEDGERNAME>
+            <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+            <AMOUNT>{round(debit, 2)}</AMOUNT>
+        </ALLLEDGERENTRIES.LIST>
+    </VOUCHER>"""
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<ENVELOPE>
+    <HEADER>
+        <TALLYREQUEST>Import Data</TALLYREQUEST>
+    </HEADER>
+    <BODY>
+        <IMPORTDATA>
+            <REQUESTDESC>
+                <REPORTNAME>Vouchers</REPORTNAME>
+                <STATICVARIABLES>
+                    <SVCURRENTCOMPANY>{account_holder}</SVCURRENTCOMPANY>
+                </STATICVARIABLES>
+            </REQUESTDESC>
+            <REQUESTDATA>
+                <TALLYMESSAGE xmlns:UDF="TallyUDF">
+                    {vouchers_xml}
+                </TALLYMESSAGE>
+            </REQUESTDATA>
+        </IMPORTDATA>
+    </BODY>
+</ENVELOPE>"""
+
+    return xml
+
+
+@app.post("/download-tally-xml")
+async def download_tally_xml(file: UploadFile = File(...), password: str = Form(None)):
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(400, "File too large.")
+
+    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
+        process_statement(contents, password)
+    )
+
+    xml_content = generate_tally_xml(df, account_info, summary)
+
+    filename = (
+        f"tally_{account_info.get('bank_name', 'bank').lower().replace(' ', '_')}.xml"
+    )
+
+    return StreamingResponse(
+        io.BytesIO(xml_content.encode("utf-8")),
+        media_type="application/xml",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )

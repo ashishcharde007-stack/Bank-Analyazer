@@ -1221,3 +1221,7 @@ def parse_idbi_pdf(file_stream, password=None):
 
     df = pd.DataFrame(transactions)
     return df
+
+
+
+
