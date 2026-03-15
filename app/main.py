@@ -1001,3 +1001,30 @@ async def download_tally_xml(file: UploadFile = File(...), password: str = Form(
         media_type="application/xml",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+# -------------------------------
+# 📥 DOWNLOAD TRANSACTIONS ONLY API
+# -------------------------------
+
+@app.post("/download-transactions")
+async def download_transactions(file: UploadFile = File(...), password: str = Form(None)):
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(400, "File too large.")
+
+    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
+        process_statement(contents, password)
+    )
+
+    df_export = df.copy()
+    df_export["date"] = df_export["date"].dt.strftime("%d-%m-%Y")
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_export.to_excel(writer, index=False, sheet_name="Transactions")
+
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=transactions.xlsx"},
+    )
