@@ -7,7 +7,6 @@ import io
 import re
 from datetime import datetime
 
-# ✅ IDBI CHANGE 1: Added parse_idbi_pdf to the import
 from app.parser import (
     parse_hdfc_pdf,
     parse_sbi_pdf,
@@ -17,8 +16,6 @@ from app.parser import (
     parse_idbi_pdf,
 )
 from app.analyzer import analyze_emi
-
-# ✅ CATEGORIZER: Import categorization functions
 from app.categorizer import add_categories, generate_category_summary
 
 app = FastAPI(title="Bank Statement Analyzer V1")
@@ -42,12 +39,6 @@ app.add_middleware(
 def extract_account_info(
     contents: bytes, bank: str, password: str | None = None
 ) -> dict:
-    """
-    Extract account holder metadata from the first page of the PDF.
-    Returns a unified dict for HDFC, SBI, Axis, PNB, UBIN and IDBI statements.
-    """
-
-    # PNB PDFs are encrypted with the account number as password.
     if bank == "pnb":
         from app.parser import _pnb_open
 
@@ -59,13 +50,11 @@ def extract_account_info(
             raw_text = pdf.pages[0].extract_text() or ""
             words = pdf.pages[0].extract_words()
 
-    # Only HDFC needs word-level coordinate parsing for metadata
     if bank not in ("pnb", "idbi"):
         rows = {}
         for w in words:
             rows.setdefault(round(w["top"], 0), []).append(w)
 
-    # ── HDFC ──────────────────────────────────────────────────────────────────
     if bank == "hdfc":
         meta = {}
         name = ""
@@ -77,7 +66,6 @@ def extract_account_info(
             texts = [w["text"] for w in rw]
             x0s = [w["x0"] for w in rw]
 
-            # Account holder name — left column, y < 100
             if top < 100 and x0s[0] < 70:
                 line = " ".join(texts)
                 if any(p in line for p in ("MR.", "MRS.", "MS.")):
@@ -85,13 +73,11 @@ def extract_account_info(
                         line = line.replace(p, "")
                     name = line.strip()
 
-            # Statement period row
             if "From" in texts and "To" in texts:
                 dates = re.findall(r"\d{2}/\d{2}/\d{4}", " ".join(texts))
                 if len(dates) >= 2:
                     from_date, to_date = dates[0], dates[1]
 
-            # Right-side key : value metadata (x >= 340)
             right = [(t, x) for t, x in zip(texts, x0s) if x >= 340]
             if len(right) < 2:
                 continue
@@ -104,7 +90,6 @@ def extract_account_info(
 
         m = re.search(r"RTGS/NEFTIFSC:\s*(\w+)", raw_text)
         ifsc = m.group(1) if m else ""
-
         acc_no = re.sub(r"\s*OTHER\s*", "", meta.get("AccountNo", "")).strip()
 
         return {
@@ -128,7 +113,6 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "hdfc"),
         }
 
-    # ── Axis Bank ─────────────────────────────────────────────────────────────
     elif bank == "axis":
 
         def _axis_field(label):
@@ -173,9 +157,7 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "axis"),
         }
 
-    # ── PNB (Punjab National Bank) ────────────────────────────────────────────
     elif bank == "pnb":
-
         acc_m = re.search(r"Account[:\s]+([\d]{10,20})", raw_text)
         acc_no = acc_m.group(1).strip() if acc_m else ""
 
@@ -216,9 +198,7 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "pnb"),
         }
 
-    # ── Union Bank of India ───────────────────────────────────────────────────
     elif bank == "ubin":
-
         acc_m = re.search(r"Account No\s+(\d+)", raw_text)
         acc_no = acc_m.group(1).strip() if acc_m else ""
 
@@ -269,10 +249,7 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "ubin"),
         }
 
-    # ✅ IDBI CHANGE 2: IDBI Bank metadata extractor
-    # ── IDBI Bank ─────────────────────────────────────────────────────────────
     elif bank == "idbi":
-
         name_m = re.search(r"Primary Account Holder Name\s*[:\t]+\s*(.+)", raw_text)
         name = name_m.group(1).strip() if name_m else ""
 
@@ -313,7 +290,6 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "idbi"),
         }
 
-    # ── SBI ───────────────────────────────────────────────────────────────────
     else:
 
         def field(label):
@@ -360,7 +336,6 @@ def extract_account_info(
 
 
 def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
-    """Return a human-readable period string like 4mo (11d)."""
     try:
         if fmt in ("hdfc", "idbi"):
             d1 = datetime.strptime(from_date, "%d/%m/%Y")
@@ -375,7 +350,6 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
             d1 = datetime.strptime(from_date, "%d/%m/%Y")
             d2 = datetime.strptime(to_date, "%d/%m/%Y")
         else:
-            # SBI uses "01 Apr 2023" style
             d1 = datetime.strptime(from_date, "%d %b %Y")
             d2 = datetime.strptime(to_date, "%d %b %Y")
         diff = (d2 - d1).days
@@ -420,14 +394,6 @@ _BUSINESS_KW = [
 
 
 def classify_account_type(df: pd.DataFrame) -> dict:
-    """
-    Classify the account holder type using 10 transaction-based signals.
-
-    Returns a dict with:
-        category    : str  — Salaried / Business / Non-Salaried / Regular
-        scores      : dict — raw signal scores per category
-        signals     : list — human-readable reasons for the classification
-    """
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     narrations = df["narration"].str.upper().fillna("")
@@ -449,13 +415,11 @@ def classify_account_type(df: pd.DataFrame) -> dict:
     scores = {"Salaried": 0, "Business": 0, "Non-Salaried": 0, "Regular": 0}
     signals = []
 
-    # ── Signal 1: Salary keywords ──────────────────────────────────────────
     sal_hits = sum(1 for n in credit_narr for p in _SALARY_KW if re.search(p, n))
     if sal_hits:
         scores["Salaried"] += min(sal_hits * 5, 20)
         signals.append(f"Salary keyword detected in {sal_hits} transaction(s)")
 
-    # ── Signal 2: Fixed monthly credit amount (CV) ─────────────────────────
     if len(monthly_cr_max) >= 2:
         mean = monthly_cr_max.mean()
         cv = monthly_cr_max.std() / mean if mean else 1.0
@@ -473,7 +437,6 @@ def classify_account_type(df: pd.DataFrame) -> dict:
             scores["Business"] += 4
             scores["Non-Salaried"] += 2
 
-    # ── Signal 3: Credit date falls in salary window (25th – 5th) ──────────
     in_window = credits[credits["day"].apply(lambda d: d >= 25 or d <= 5)]
     ratio = len(in_window) / len(credits) if len(credits) else 0
     if ratio >= 0.6 and len(credits) >= 2:
@@ -482,7 +445,6 @@ def classify_account_type(df: pd.DataFrame) -> dict:
             f"{ratio:.0%} of credits fall in salary date window (25th–5th of month)"
         )
 
-    # ── Signal 4: Average credits per month ───────────────────────────────
     if avg_credits_pm <= 2:
         scores["Salaried"] += 10
         signals.append(
@@ -499,7 +461,6 @@ def classify_account_type(df: pd.DataFrame) -> dict:
             f"High credits/month ({avg_credits_pm:.1f}) — business collection pattern"
         )
 
-    # ── Signal 5: EMI / SIP / Loan deductions ─────────────────────────────
     emi_count = narrations.str.contains(r"EMI|SIP|LOAN|ACH", regex=True).sum()
     if emi_count >= 3:
         scores["Salaried"] += 8
@@ -510,7 +471,6 @@ def classify_account_type(df: pd.DataFrame) -> dict:
         scores["Salaried"] += 3
         scores["Non-Salaried"] += 2
 
-    # ── Signal 6: Transaction volume per month ────────────────────────────
     if avg_txns_pm >= 20:
         scores["Business"] += 12
         signals.append(
@@ -523,7 +483,6 @@ def classify_account_type(df: pd.DataFrame) -> dict:
         scores["Salaried"] += 3
         scores["Regular"] += 3
 
-    # ── Signal 7: Multiple credits same day (round-tripping / collections) ─
     cr_per_day = credits.groupby(credits["date"].dt.date).size()
     days_multi_cr = (cr_per_day > 2).sum()
     if days_multi_cr >= 3:
@@ -534,7 +493,6 @@ def classify_account_type(df: pd.DataFrame) -> dict:
     elif days_multi_cr >= 1:
         scores["Business"] += 4
 
-    # ── Signal 8: Business keywords ───────────────────────────────────────
     biz_hits = sum(1 for n in narrations for p in _BUSINESS_KW if re.search(p, n))
     if biz_hits:
         scores["Business"] += min(biz_hits * 4, 16)
@@ -542,7 +500,6 @@ def classify_account_type(df: pd.DataFrame) -> dict:
             f"Business keyword detected in {biz_hits} transaction(s) (GST/TDS/Vendor etc.)"
         )
 
-    # ── Signal 9: Varied sources at low volume (freelance / non-salaried) ──
     unique_cr_narr = credits["narration"].nunique()
     if 3 <= unique_cr_narr <= 10 and avg_credits_pm <= 5:
         scores["Non-Salaried"] += 6
@@ -550,24 +507,18 @@ def classify_account_type(df: pd.DataFrame) -> dict:
             f"{unique_cr_narr} different credit sources at low volume — project/freelance income"
         )
 
-    # ── Signal 10: Very low activity → Regular savings account ────────────
     if total_cr_txns <= 3 and avg_txns_pm < 5:
         scores["Regular"] += 12
         signals.append(
             f"Very low activity ({total_cr_txns} total credits) — regular/savings account"
         )
 
-    # ── Winner ─────────────────────────────────────────────────────────────
     winner = max(scores, key=scores.get)
     if scores[winner] < 5:
         winner = "Regular"
         signals.append("No strong income pattern detected — classified as Regular")
 
-    return {
-        "category": winner,
-        "scores": scores,
-        "signals": signals,
-    }
+    return {"category": winner, "scores": scores, "signals": signals}
 
 
 # -------------------------------
@@ -629,7 +580,6 @@ def generate_loan_readiness(summary, monthly_summary):
     avg_expense = monthly_summary["debit"].mean() if months else 0
     surplus = avg_income - avg_expense
 
-    # Surplus Score (40)
     if surplus > avg_income * 0.25:
         surplus_score = 40
     elif surplus > 0:
@@ -637,7 +587,6 @@ def generate_loan_readiness(summary, monthly_summary):
     else:
         surplus_score = 5
 
-    # Income Stability (30)
     variation = monthly_summary["credit"].std() / avg_income if avg_income else 1
     if variation < 0.25:
         stability_score = 30
@@ -646,7 +595,6 @@ def generate_loan_readiness(summary, monthly_summary):
     else:
         stability_score = 5
 
-    # Balance Health (30)
     closing_balance = summary["closing_balance"]
     if closing_balance > avg_expense:
         balance_score = 30
@@ -676,16 +624,321 @@ def generate_loan_readiness(summary, monthly_summary):
 
 
 # -------------------------------
+# 🏦 LOAN OFFER MATCHER
+# -------------------------------
+
+LENDER_CATALOG = [
+    {
+        "lender": "Bajaj Finserv",
+        "type": "Personal Loan",
+        "min_score": 40,
+        "min_surplus": 8000,
+        "max_loan_multiplier": 24,
+        "interest_rate": "13% p.a.",
+        "tag": "Instant approval",
+        "affiliate_url": "https://www.bajajfinserv.in/personal-loan?ref=BANKIE001",
+    },
+    {
+        "lender": "MoneyView",
+        "type": "Personal Loan",
+        "min_score": 35,
+        "min_surplus": 6000,
+        "max_loan_multiplier": 20,
+        "interest_rate": "14% p.a.",
+        "tag": "No branch visit",
+        "affiliate_url": "https://moneyview.in/personal-loan?ref=BANKIE001",
+    },
+    {
+        "lender": "KreditBee",
+        "type": "Personal Loan",
+        "min_score": 30,
+        "min_surplus": 5000,
+        "max_loan_multiplier": 18,
+        "interest_rate": "15.5% p.a.",
+        "tag": "Approval in 10 mins",
+        "affiliate_url": "https://kreditbee.in?ref=BANKIE001",
+    },
+    {
+        "lender": "HDFC Bank",
+        "type": "Home Loan",
+        "min_score": 70,
+        "min_surplus": 20000,
+        "max_loan_multiplier": 60,
+        "interest_rate": "8.75% p.a.",
+        "tag": "Lowest rate",
+        "affiliate_url": "https://www.hdfcbank.com/home-loan?ref=BANKIE001",
+    },
+    {
+        "lender": "Tata Capital",
+        "type": "Business Loan",
+        "min_score": 50,
+        "min_surplus": 15000,
+        "max_loan_multiplier": 36,
+        "interest_rate": "12% p.a.",
+        "tag": "For business owners",
+        "affiliate_url": "https://www.tatacapital.com/business-loan?ref=BANKIE001",
+    },
+    {
+        "lender": "IndiaLends",
+        "type": "Personal Loan",
+        "min_score": 25,
+        "min_surplus": 4000,
+        "max_loan_multiplier": 15,
+        "interest_rate": "16% p.a.",
+        "tag": "Low score accepted",
+        "affiliate_url": "https://indialends.com?ref=BANKIE001",
+    },
+]
+
+
+def generate_loan_offers(loan_metrics: dict, account_category: str) -> dict:
+    score = loan_metrics.get("loan_score", 0)
+    surplus = loan_metrics.get("monthly_surplus", 0)
+
+    emi_capacity = surplus * 0.45
+    max_personal_loan = int(emi_capacity * 36)
+    max_home_loan = int(emi_capacity * 180)
+
+    eligible = []
+    for lender in LENDER_CATALOG:
+        if score < lender["min_score"]:
+            continue
+        if surplus < lender["min_surplus"]:
+            continue
+        if (
+            lender["type"] == "Home Loan"
+            and account_category not in ("Salaried",)
+            and score < 75
+        ):
+            continue
+        if lender["type"] == "Business Loan" and account_category == "Salaried":
+            continue
+
+        max_loan = int(surplus * lender["max_loan_multiplier"])
+        eligible.append(
+            {
+                "lender": lender["lender"],
+                "type": lender["type"],
+                "max_loan": max_loan,
+                "interest_rate": lender["interest_rate"],
+                "tag": lender["tag"],
+                "affiliate_url": lender["affiliate_url"],
+            }
+        )
+
+    eligible.sort(key=lambda x: float(x["interest_rate"].replace("% p.a.", "")))
+    eligible = eligible[:3]
+
+    avg_income = loan_metrics.get("avg_monthly_income", 0)
+    avg_expense = loan_metrics.get("avg_monthly_expense", 0)
+    expense_ratio = (avg_expense / avg_income * 100) if avg_income else 0
+
+    if surplus <= 0:
+        tip = (
+            f"Your expenses exceed your income. Reducing monthly spending by "
+            f"₹{abs(int(surplus)) + 5000:,} would make you eligible for loans up to "
+            f"₹{int(5000 * 36):,}."
+        )
+    elif expense_ratio > 75:
+        reduction = int(avg_expense * 0.10)
+        new_surplus = surplus + reduction
+        new_max = int(new_surplus * 0.45 * 36)
+        tip = (
+            f"Your expenses are {expense_ratio:.0f}% of income. "
+            f"Reducing monthly expenses by ₹{reduction:,} would raise your "
+            f"eligible loan amount to ₹{new_max:,}."
+        )
+    elif score < 60:
+        tip = (
+            "Your income is inconsistent month-to-month. "
+            "3 months of stable income credits will push your score above 70 "
+            "and unlock lower interest rate offers."
+        )
+    else:
+        tip = (
+            f"Your profile looks healthy. Maintaining this surplus of "
+            f"₹{int(surplus):,}/month for 3 more months could qualify you "
+            f"for home loan offers above ₹{max_home_loan:,}."
+        )
+
+    return {
+        "max_personal_loan": max_personal_loan,
+        "max_home_loan": max_home_loan,
+        "eligible_offers": eligible,
+        "improvement_tip": tip,
+        "offers_count": len(eligible),
+    }
+
+
+# -------------------------------
+# 🏆 FINANCIAL HEALTH SCORE
+# -------------------------------
+
+
+def generate_financial_health_score(
+    summary: dict,
+    monthly_summary,
+    loan_metrics: dict,
+    emi_analysis: dict,
+    account_category: str,
+) -> dict:
+    scores = {}
+
+    avg_income = loan_metrics.get("avg_monthly_income", 0) or 0
+    avg_expense = loan_metrics.get("avg_monthly_expense", 0) or 0
+    surplus = loan_metrics.get("monthly_surplus", 0) or 0
+    closing_bal = summary.get("closing_balance", 0) or 0
+    emi_summary = emi_analysis.get("emi_summary", {})
+
+    # 1. Savings rate (25 pts)
+    savings_rate = (surplus / avg_income) if avg_income > 0 else 0
+    if savings_rate >= 0.30:
+        s1, s1_label = 25, f"Excellent — saving {savings_rate:.0%} of income"
+    elif savings_rate >= 0.20:
+        s1, s1_label = 20, f"Good — saving {savings_rate:.0%} of income"
+    elif savings_rate >= 0.10:
+        s1, s1_label = 12, f"Average — saving {savings_rate:.0%} of income"
+    elif savings_rate > 0:
+        s1, s1_label = 6, f"Low — saving only {savings_rate:.0%} of income"
+    else:
+        s1, s1_label = 0, "Spending exceeds income"
+    scores["savings_rate"] = {"score": s1, "max": 25, "label": s1_label}
+
+    # 2. Expense control (20 pts)
+    if len(monthly_summary) >= 2:
+        exp_cv = float(monthly_summary["debit"].std()) / (
+            float(monthly_summary["debit"].mean()) or 1
+        )
+        if exp_cv < 0.15:
+            s2, s2_label = 20, "Very stable monthly spending"
+        elif exp_cv < 0.30:
+            s2, s2_label = 14, "Moderate spending variation"
+        elif exp_cv < 0.50:
+            s2, s2_label = 8, "High spending variation"
+        else:
+            s2, s2_label = 3, "Very erratic spending pattern"
+    else:
+        s2, s2_label = 10, "Not enough months to evaluate"
+    scores["expense_control"] = {"score": s2, "max": 20, "label": s2_label}
+
+    # 3. Income stability (20 pts)
+    if len(monthly_summary) >= 2:
+        inc_cv = float(monthly_summary["credit"].std()) / (
+            float(monthly_summary["credit"].mean()) or 1
+        )
+        if inc_cv < 0.10:
+            s3, s3_label = 20, "Very consistent income — salary-like"
+        elif inc_cv < 0.25:
+            s3, s3_label = 15, "Fairly consistent income"
+        elif inc_cv < 0.50:
+            s3, s3_label = 8, "Variable income — freelance/business pattern"
+        else:
+            s3, s3_label = 3, "Highly irregular income"
+    else:
+        s3, s3_label = 10, "Not enough months to evaluate"
+    scores["income_stability"] = {"score": s3, "max": 20, "label": s3_label}
+
+    # 4. EMI health (20 pts)
+    bounce_count = emi_summary.get("emi_bounce_count_last_6_months", 0) or 0
+    emi_to_income = emi_summary.get("emi_to_income_ratio") or 0
+    if bounce_count == 0 and emi_to_income < 0.30:
+        s4, s4_label = 20, "No EMI bounces, healthy EMI ratio"
+    elif bounce_count == 0 and emi_to_income < 0.50:
+        s4, s4_label = (
+            14,
+            f"No bounces but EMI ratio is {emi_to_income:.0%} — a bit high",
+        )
+    elif bounce_count <= 1:
+        s4, s4_label = 8, f"{bounce_count} EMI bounce in last 6 months"
+    else:
+        s4, s4_label = 2, f"{bounce_count} EMI bounces in last 6 months — risky"
+    scores["emi_health"] = {"score": s4, "max": 20, "label": s4_label}
+
+    # 5. Balance cushion (15 pts)
+    months_cushion = (closing_bal / avg_expense) if avg_expense > 0 else 0
+    if months_cushion >= 3:
+        s5, s5_label = 15, f"Strong — {months_cushion:.1f}x monthly expense in balance"
+    elif months_cushion >= 1.5:
+        s5, s5_label = (
+            10,
+            f"Adequate — {months_cushion:.1f}x monthly expense in balance",
+        )
+    elif months_cushion >= 0.5:
+        s5, s5_label = (
+            5,
+            f"Thin — only {months_cushion:.1f}x monthly expense in balance",
+        )
+    else:
+        s5, s5_label = 0, "Very low balance cushion"
+    scores["balance_cushion"] = {"score": s5, "max": 15, "label": s5_label}
+
+    total = sum(v["score"] for v in scores.values())
+
+    if total >= 85:
+        grade, grade_desc, color = (
+            "Excellent",
+            "You are in the top financial health bracket",
+            "green",
+        )
+    elif total >= 70:
+        grade, grade_desc, color = (
+            "Good",
+            "Solid finances with minor areas to improve",
+            "teal",
+        )
+    elif total >= 50:
+        grade, grade_desc, color = (
+            "Average",
+            "Room to improve savings and EMI management",
+            "amber",
+        )
+    elif total >= 30:
+        grade, grade_desc, color = (
+            "Needs work",
+            "Focus on reducing expenses and EMI burden",
+            "orange",
+        )
+    else:
+        grade, grade_desc, color = (
+            "At Risk",
+            "Urgent: expenses exceed income or frequent bounces",
+            "red",
+        )
+
+    weakest = min(scores, key=lambda k: scores[k]["score"] / scores[k]["max"])
+    weak_tips = {
+        "savings_rate": "Try to save at least 20% of your income each month. Start a recurring deposit or SIP.",
+        "expense_control": "Your spending varies too much month-to-month. Set a monthly budget cap for discretionary spends.",
+        "income_stability": "Irregular income lowers your score. Building 3 months of consistent credits will improve it significantly.",
+        "emi_health": "Reduce EMI burden or clear one active loan to improve your score and loan eligibility.",
+        "balance_cushion": "Maintain at least 1.5x your monthly expense as balance buffer for emergencies.",
+    }
+
+    share_text = (
+        f"My Bankie financial health score is {total}/100 ({grade}). "
+        f"Check yours free at bankie.in — no sign-up, no data stored."
+    )
+
+    return {
+        "health_score": total,
+        "grade": grade,
+        "grade_desc": grade_desc,
+        "color": color,
+        "breakdown": scores,
+        "top_tip": weak_tips[weakest],
+        "weakest_area": weakest,
+        "share_text": share_text,
+        "savings_rate_pct": round(savings_rate * 100, 1),
+        "emi_burden_pct": round(emi_to_income * 100, 1) if emi_to_income else 0,
+    }
+
+
+# -------------------------------
 # 🏦 BANK AUTO-DETECTION
 # -------------------------------
 
 
 def detect_bank(contents: bytes, password: str | None = None) -> str:
-    """
-    Detect the bank from the first page text of the PDF.
-    Returns one of: "hdfc", "sbi", "axis", "pnb", "ubin", "idbi"
-    """
-    # PNB PDFs are password-protected — try _pnb_open first
     try:
         from app.parser import _pnb_open
 
@@ -697,9 +950,8 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
         ):
             return "pnb"
     except Exception:
-        pass  # Not a PNB PDF — fall through to unencrypted detection
+        pass
 
-    # Unencrypted banks
     try:
         with pdfplumber.open(io.BytesIO(contents), password=password) as pdf:
             first_page_text = pdf.pages[0].extract_text() or ""
@@ -710,18 +962,14 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
 
     if "state bank of india" in text_lower or "sbchq" in text_lower:
         return "sbi"
-
     if (
         "axis bank" in text_lower
         or "axisbank" in text_lower
         or "axis account" in text_lower
     ):
         return "axis"
-
     if "union bank" in text_lower or re.search(r"\bubin\b", text_lower):
         return "ubin"
-
-    # ✅ IDBI CHANGE 4: Detect IDBI Bank
     if (
         "idbi bank" in text_lower
         or "idbi tower" in text_lower
@@ -748,7 +996,6 @@ def process_statement(contents: bytes, password: str | None = None):
         df = parse_pnb_pdf(io.BytesIO(contents), password)
     elif bank == "ubin":
         df = parse_ubin_pdf(io.BytesIO(contents), password)
-    # ✅ IDBI CHANGE 5: Route IDBI PDFs to parse_idbi_pdf
     elif bank == "idbi":
         df = parse_idbi_pdf(io.BytesIO(contents), password)
     else:
@@ -758,8 +1005,6 @@ def process_statement(contents: bytes, password: str | None = None):
         raise HTTPException(400, "No transactions detected.")
 
     df = df.sort_values(["date"]).reset_index(drop=True)
-
-    # ✅ CATEGORIZER: Add category column to every transaction
     df = add_categories(df)
 
     first = df.iloc[0]
@@ -776,6 +1021,7 @@ def process_statement(contents: bytes, password: str | None = None):
     account_info["account_category"] = _classification["category"]
     account_info["account_type_signals"] = _classification["signals"]
     account_info["account_type_scores"] = _classification["scores"]
+
     summary = generate_summary(df)
     monthly_summary = generate_monthly_summary(df)
 
@@ -783,9 +1029,30 @@ def process_statement(contents: bytes, password: str | None = None):
     summary["closing_balance"] = round(closing_balance, 2)
 
     loan_metrics = generate_loan_readiness(summary, monthly_summary)
-
     emi_analysis = analyze_emi(df)
-    return df, summary, monthly_summary, loan_metrics, account_info, emi_analysis
+
+    # ✅ CHANGE 1: Generate loan offers and health score
+    loan_offers = generate_loan_offers(
+        loan_metrics, account_info.get("account_category", "Regular")
+    )
+    health_score = generate_financial_health_score(
+        summary,
+        monthly_summary,
+        loan_metrics,
+        emi_analysis,
+        account_info.get("account_category", "Regular"),
+    )
+
+    return (
+        df,
+        summary,
+        monthly_summary,
+        loan_metrics,
+        account_info,
+        emi_analysis,
+        loan_offers,
+        health_score,
+    )
 
 
 # -------------------------------
@@ -802,9 +1069,17 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
-        process_statement(contents, password)
-    )
+    # ✅ CHANGE 2: Unpack 8 values
+    (
+        df,
+        summary,
+        monthly_summary,
+        loan_metrics,
+        account_info,
+        emi_analysis,
+        loan_offers,
+        health_score,
+    ) = process_statement(contents, password)
 
     if not monthly_summary.empty:
         summary["highest_income_month"] = monthly_summary.loc[
@@ -818,10 +1093,9 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
         summary["highest_expense_month"] = None
 
     summary["total_transactions"] = len(df)
-
-    # ✅ CATEGORIZER: Generate category breakdown for the response
     category_summary = generate_category_summary(df)
 
+    # ✅ CHANGE 3: Include loan_offers and health_score in response
     return {
         "account_info": account_info,
         "summary": summary,
@@ -830,6 +1104,8 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
         "emi_analysis": emi_analysis,
         "category_summary": category_summary,
         "total_transactions": len(df),
+        "loan_offers": loan_offers,
+        "health_score": health_score,
     }
 
 
@@ -844,9 +1120,17 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
-        process_statement(contents, password)
-    )
+    # ✅ CHANGE 4: Unpack 8 values
+    (
+        df,
+        summary,
+        monthly_summary,
+        loan_metrics,
+        account_info,
+        emi_analysis,
+        loan_offers,
+        health_score,
+    ) = process_statement(contents, password)
 
     df_export = df.copy()
     df_export["date"] = df_export["date"].dt.strftime("%d-%m-%Y")
@@ -854,7 +1138,6 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_export.to_excel(writer, index=False, sheet_name="Transactions")
-
         pd.DataFrame(account_info.items(), columns=["Field", "Value"]).to_excel(
             writer, index=False, sheet_name="Account Info"
         )
@@ -869,7 +1152,6 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
             emi_analysis["emi_summary"].items(), columns=["Metric", "Value"]
         ).to_excel(writer, index=False, sheet_name="EMI Analysis")
 
-        # ✅ CATEGORIZER: Add Category Summary sheet to Excel
         category_summary = generate_category_summary(df)
         pd.DataFrame(category_summary["expense_by_category"]).to_excel(
             writer, index=False, sheet_name="Expense by Category"
@@ -888,23 +1170,17 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
 
 # -------------------------------
 # 🏦 TALLY XML DOWNLOAD API
-# ------------------------------
+# -------------------------------
 
 
 def generate_tally_xml(df, account_info, summary) -> str:
-    """
-    Generate Tally Prime compatible XML (TallyXML format).
-    Each transaction becomes a Payment or Receipt voucher.
-    """
     bank_ledger = account_info.get("bank_name", "Bank Account")
     account_holder = account_info.get("account_holder", "")
-
     vouchers_xml = ""
 
     for _, row in df.iterrows():
         try:
-            date_obj = pd.to_datetime(row["date"])
-            tally_date = date_obj.strftime("%Y%m%d")  # Tally uses YYYYMMDD
+            tally_date = pd.to_datetime(row["date"]).strftime("%Y%m%d")
         except Exception:
             continue
 
@@ -918,7 +1194,6 @@ def generate_tally_xml(df, account_info, summary) -> str:
         debit = float(row.get("debit", 0) or 0)
 
         if credit > 0:
-            # Money IN → Receipt Voucher
             vouchers_xml += f"""
     <VOUCHER VCHTYPE="Receipt" ACTION="Create">
         <DATE>{tally_date}</DATE>
@@ -935,9 +1210,7 @@ def generate_tally_xml(df, account_info, summary) -> str:
             <AMOUNT>{round(credit, 2)}</AMOUNT>
         </ALLLEDGERENTRIES.LIST>
     </VOUCHER>"""
-
         elif debit > 0:
-            # Money OUT → Payment Voucher
             vouchers_xml += f"""
     <VOUCHER VCHTYPE="Payment" ACTION="Create">
         <DATE>{tally_date}</DATE>
@@ -955,7 +1228,7 @@ def generate_tally_xml(df, account_info, summary) -> str:
         </ALLLEDGERENTRIES.LIST>
     </VOUCHER>"""
 
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
 <ENVELOPE>
     <HEADER>
         <TALLYREQUEST>Import Data</TALLYREQUEST>
@@ -977,8 +1250,6 @@ def generate_tally_xml(df, account_info, summary) -> str:
     </BODY>
 </ENVELOPE>"""
 
-    return xml
-
 
 @app.post("/download-tally-xml")
 async def download_tally_xml(file: UploadFile = File(...), password: str = Form(None)):
@@ -986,12 +1257,18 @@ async def download_tally_xml(file: UploadFile = File(...), password: str = Form(
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
-        process_statement(contents, password)
-    )
+    (
+        df,
+        summary,
+        monthly_summary,
+        loan_metrics,
+        account_info,
+        emi_analysis,
+        loan_offers,
+        health_score,
+    ) = process_statement(contents, password)
 
     xml_content = generate_tally_xml(df, account_info, summary)
-
     filename = (
         f"tally_{account_info.get('bank_name', 'bank').lower().replace(' ', '_')}.xml"
     )
@@ -1001,19 +1278,31 @@ async def download_tally_xml(file: UploadFile = File(...), password: str = Form(
         media_type="application/xml",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
 # -------------------------------
 # 📥 DOWNLOAD TRANSACTIONS ONLY API
 # -------------------------------
 
+
 @app.post("/download-transactions")
-async def download_transactions(file: UploadFile = File(...), password: str = Form(None)):
+async def download_transactions(
+    file: UploadFile = File(...), password: str = Form(None)
+):
     contents = await file.read()
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    df, summary, monthly_summary, loan_metrics, account_info, emi_analysis = (
-        process_statement(contents, password)
-    )
+    (
+        df,
+        summary,
+        monthly_summary,
+        loan_metrics,
+        account_info,
+        emi_analysis,
+        loan_offers,
+        health_score,
+    ) = process_statement(contents, password)
 
     df_export = df.copy()
     df_export["date"] = df_export["date"].dt.strftime("%d-%m-%Y")
