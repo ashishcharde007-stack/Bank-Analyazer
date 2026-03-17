@@ -14,6 +14,7 @@ from app.parser import (
     parse_pnb_pdf,
     parse_ubin_pdf,
     parse_idbi_pdf,
+    parse_bob_pdf,          # ← NEW
 )
 from app.analyzer import analyze_emi
 from app.categorizer import add_categories, generate_category_summary
@@ -50,7 +51,7 @@ def extract_account_info(
             raw_text = pdf.pages[0].extract_text() or ""
             words = pdf.pages[0].extract_words()
 
-    if bank not in ("pnb", "idbi"):
+    if bank not in ("pnb", "idbi", "bob"):
         rows = {}
         for w in words:
             rows.setdefault(round(w["top"], 0), []).append(w)
@@ -290,6 +291,66 @@ def extract_account_info(
             "period": _compute_period(from_date, to_date, "idbi"),
         }
 
+    # ── Bank of Baroda ───────────────────────────────────────────────────────
+    elif bank == "bob":
+        # Use pdfplumber word coordinates to cleanly separate name from branch
+        with pdfplumber.open(io.BytesIO(contents), password=password) as pdf:
+            pg_words = pdf.pages[0].extract_words()
+
+        word_rows = {}
+        for w in pg_words:
+            word_rows.setdefault(round(w["top"], 1), []).append(w)
+
+        name   = ""
+        branch = ""
+        atype  = ""
+
+        for top, rw in sorted(word_rows.items()):
+            rw_s = sorted(rw, key=lambda w: w["x0"])
+            texts = [w["text"] for w in rw_s]
+            x0s   = [w["x0"]   for w in rw_s]
+
+            # Name row: y ≈ 226 — customer name on left, branch on right
+            if 220 < top < 235:
+                name   = " ".join(t for t, x in zip(texts, x0s) if x < 490)
+                branch = " ".join(t for t, x in zip(texts, x0s) if x >= 490)
+
+            # Account type row: y ≈ 296 — single token on the left
+            if 290 < top < 302 and x0s[0] < 100:
+                atype = texts[0]
+
+        acc_m = re.search(r"\b(\d{14,17})\b", raw_text)
+        acc_no = acc_m.group(1) if acc_m else ""
+
+        ifsc_m = re.search(r"BARB\w+", raw_text)
+        ifsc   = ifsc_m.group(0) if ifsc_m else ""
+
+        period_m = re.search(
+            r"Account Statement from\s+(\d{2}-\d{2}-\d{4})\s+to\s+(\d{2}-\d{2}-\d{4})",
+            raw_text,
+        )
+        from_date = period_m.group(1) if period_m else ""
+        to_date   = period_m.group(2) if period_m else ""
+
+        return {
+            "account_holder":        name,
+            "bank_name":             "Bank of Baroda",
+            "account_number":        acc_no,
+            "masked_account_number": ("- • ••••" + acc_no[-4:] if len(acc_no) >= 4 else acc_no),
+            "account_type":          atype,
+            "ifsc_code":             ifsc,
+            "branch":                branch,
+            "email":                 "",
+            "phone":                 "",
+            "customer_id":           "",
+            "account_open_date":     "",
+            "od_limit":              "",
+            "currency":              "INR",
+            "from_date":             from_date,
+            "to_date":               to_date,
+            "period":                _compute_period(from_date, to_date, "bob"),
+        }
+
     else:
 
         def field(label):
@@ -349,6 +410,9 @@ def _compute_period(from_date: str, to_date: str, fmt: str) -> str:
         elif fmt == "ubin":
             d1 = datetime.strptime(from_date, "%d/%m/%Y")
             d2 = datetime.strptime(to_date, "%d/%m/%Y")
+        elif fmt == "bob":                          # ← NEW
+            d1 = datetime.strptime(from_date, "%d-%m-%Y")
+            d2 = datetime.strptime(to_date,   "%d-%m-%Y")
         else:
             d1 = datetime.strptime(from_date, "%d %b %Y")
             d2 = datetime.strptime(to_date, "%d %b %Y")
@@ -960,6 +1024,15 @@ def detect_bank(contents: bytes, password: str | None = None) -> str:
 
     text_lower = first_page_text.lower()
 
+    # ── Bank of Baroda detection ─────────────────────────────────────────────
+    if (
+        "bank of baroda" in text_lower
+        or "barb0" in text_lower
+        or "bob world" in text_lower
+        or re.search(r"\bbarb\w+", text_lower)
+    ):
+        return "bob"
+
     if "state bank of india" in text_lower or "sbchq" in text_lower:
         return "sbi"
     if (
@@ -998,6 +1071,8 @@ def process_statement(contents: bytes, password: str | None = None):
         df = parse_ubin_pdf(io.BytesIO(contents), password)
     elif bank == "idbi":
         df = parse_idbi_pdf(io.BytesIO(contents), password)
+    elif bank == "bob":                                    # ← NEW
+        df = parse_bob_pdf(io.BytesIO(contents), password)
     else:
         df = parse_hdfc_pdf(io.BytesIO(contents), password)
 
@@ -1031,7 +1106,6 @@ def process_statement(contents: bytes, password: str | None = None):
     loan_metrics = generate_loan_readiness(summary, monthly_summary)
     emi_analysis = analyze_emi(df)
 
-    # ✅ CHANGE 1: Generate loan offers and health score
     loan_offers = generate_loan_offers(
         loan_metrics, account_info.get("account_category", "Regular")
     )
@@ -1069,7 +1143,6 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    # ✅ CHANGE 2: Unpack 8 values
     (
         df,
         summary,
@@ -1095,7 +1168,6 @@ async def analyze(file: UploadFile = File(...), password: str = Form(None)):
     summary["total_transactions"] = len(df)
     category_summary = generate_category_summary(df)
 
-    # ✅ CHANGE 3: Include loan_offers and health_score in response
     return {
         "account_info": account_info,
         "summary": summary,
@@ -1120,7 +1192,6 @@ async def download_excel(file: UploadFile = File(...), password: str = Form(None
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(400, "File too large.")
 
-    # ✅ CHANGE 4: Unpack 8 values
     (
         df,
         summary,

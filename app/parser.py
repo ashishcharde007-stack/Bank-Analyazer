@@ -1223,5 +1223,231 @@ def parse_idbi_pdf(file_stream, password=None):
     return df
 
 
+# ---------------------------------------------------------------------------
+# Bank of Baroda (BOB) Statement Parser
+# ---------------------------------------------------------------------------
+#
+# BOB PDF column x0 boundaries (verified across all 11 statement pages):
+#
+#   Serial No   : x <  50
+#   Txn Date    : 50  <= x <  93    format dd-mm-yyyy
+#   Value Date  : 93  <= x < 134    format dd-mm-yyyy
+#   Description : 134 <= x < 391
+#   Debit       : 391 <= x < 456
+#   Credit      : 456 <= x < 529
+#   Balance     :       x >= 529
+#
+# Each transaction spans several PDF y-rows (all within ~22 pts of serial row):
+#   y - 22 to y - 4  : Description / narration row(s) at x=134
+#   y - 0.8 to y - 0.3: Balance row (x>=529) + value_date (x=93, page-1 only)
+#   y                : Serial row: serial, txn_date, value_date (pages 2+),
+#                      inline desc tokens, debit/credit
+#   y + 0.2 to y + 4.5: Overflow amount rows (page-1 pattern only)
+#
+# Edge-cases handled:
+#   • Invalid dates (31-06, 31-11) clamped to last valid day of month
+#   • Typo date "02-092022" auto-corrected to "02-09-2022"
+#   • Single-char junk tokens and header keywords filtered from description
+#   • Final "Do's and Don'ts" PDF page skipped automatically
+# ---------------------------------------------------------------------------
+
+import re as _re_bob
+import calendar as _cal_bob
+
+_B_SERIAL_END = 50
+_B_TXNDATE_END = 93
+_B_VALDATE_END = 134
+_B_DESC_END = 391
+_B_DEBIT_END = 456
+_B_CREDIT_END = 529  # NOTE: balance x values are 530.2–536.7, so credit < 529
+
+_BOB_DATE_RE = _re_bob.compile(r"^\d{2}-\d{2}-\d{4}$")
+_BOB_DATE_TYPO_RE = _re_bob.compile(r"^\d{2}-\d{6}$")  # e.g. "02-092022"
+_B_JUNK = _re_bob.compile(r"^[a-z]{1,3}$|^[-\u2013]$|^[0-9]{1,2}$|^[@#!$/]$")
+_B_SKIP_WORDS = {
+    "Cheque",
+    "Number",
+    "Description",
+    "Opening",
+    "Balance",
+    "Statement",
+    "Account",
+    "Page",
+    "This",
+    "maintained",
+    "Serial",
+    "Transaction",
+    "Value",
+    "Debit",
+    "Credit",
+    "No",
+    "Date",
+}
 
 
+def _bob_parse_date(text):
+    """Parse BOB date dd-mm-yyyy, fixing typos and clamping invalid days."""
+    if _BOB_DATE_TYPO_RE.match(text):  # "02-092022" → "02-09-2022"
+        text = text[:5] + "-" + text[5:]
+    if not _BOB_DATE_RE.match(text):
+        return None
+    try:
+        return datetime.strptime(text, "%d-%m-%Y")
+    except ValueError:
+        parts = text.split("-")
+        d, m, y = int(parts[0]), int(parts[1]), int(parts[2])
+        last = _cal_bob.monthrange(y, m)[1]
+        return datetime(y, m, min(d, last))
+
+
+def _bob_amt(text):
+    try:
+        return float(text.replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def parse_bob_pdf(file_stream, password=None):
+    """
+    Parse a Bank of Baroda account statement PDF into a DataFrame with columns:
+        date, narration, ref_no, value_date, debit, credit, balance
+
+    Parameters
+    ----------
+    file_stream : file-like object
+        Seekable binary stream of the PDF.
+    password : str or None
+        PDF password (BOB statements are usually unencrypted; kept for
+        API consistency with other parsers).
+    """
+    try:
+        pdf = pdfplumber.open(file_stream, password=password)
+    except Exception:
+        raise HTTPException(status_code=401, detail={"error": "PASSWORD_REQUIRED"})
+
+    transactions = []
+
+    with pdf:
+        # The last PDF page is always "Do's and Don'ts" — skip it
+        for page in pdf.pages[:-1]:
+            words = page.extract_words()
+            if not words:
+                continue
+
+            # Group words into logical rows by y-position (1-dp precision)
+            rows = {}
+            for w in words:
+                rows.setdefault(round(w["top"], 1), []).append(w)
+            sorted_rows = sorted(rows.items())
+
+            # Pre-identify serial-row y-positions to prevent description bleed
+            # from adjacent transactions
+            serial_ys = set()
+            for top, rw in sorted_rows:
+                rw_s = sorted(rw, key=lambda w: w["x0"])
+                if (
+                    rw_s[0]["x0"] < _B_SERIAL_END
+                    and rw_s[0]["text"].isdigit()
+                    and int(rw_s[0]["text"]) < 1000
+                ):
+                    serial_ys.add(top)
+
+            for top, row_words in sorted_rows:
+                rw = sorted(row_words, key=lambda w: w["x0"])
+                texts = [w["text"] for w in rw]
+                x0s = [w["x0"] for w in rw]
+
+                # Serial row: integer < 1000 at x < 50
+                if not (
+                    x0s[0] < _B_SERIAL_END
+                    and texts[0].isdigit()
+                    and int(texts[0]) < 1000
+                ):
+                    continue
+                serial = int(texts[0])
+                if serial == 1:
+                    continue  # Row 1 = Opening Balance — skip
+
+                txn_date = None
+                value_date = None
+                desc_parts = []
+                debit = 0.0
+                credit = 0.0
+                balance = 0.0
+
+                for top2, rw2 in sorted_rows:
+                    diff = top - top2  # positive → top2 is ABOVE serial row
+                    rw2_s = sorted(rw2, key=lambda w: w["x0"])
+
+                    if -4.5 <= diff <= 2.0:
+                        # ── MAIN BAND ────────────────────────────────────
+                        # Covers:
+                        #   diff = 0      : the serial row itself
+                        #   diff ≈ 0.3–0.8: balance/value-date row just above
+                        #   diff ≈ -0.4–-4.5: overflow amount rows just below
+                        #                     (page-1 layout pattern)
+                        for w in rw2_s:
+                            x, t = w["x0"], w["text"]
+                            if t in ("-", "\u2013"):
+                                continue
+                            if x < _B_SERIAL_END:
+                                pass  # serial number
+                            elif x < _B_TXNDATE_END:
+                                d = _bob_parse_date(t)
+                                if d and txn_date is None:
+                                    txn_date = d
+                            elif x < _B_VALDATE_END:
+                                d = _bob_parse_date(t)
+                                if d:
+                                    value_date = t
+                            elif x < _B_DESC_END:
+                                if not _B_JUNK.match(t) and t not in _B_SKIP_WORDS:
+                                    desc_parts.append(t)
+                            elif x < _B_DEBIT_END:
+                                v = _bob_amt(t)
+                                if v is not None and debit == 0.0:
+                                    debit = v
+                            elif x < _B_CREDIT_END:
+                                v = _bob_amt(t)
+                                if v is not None and credit == 0.0:
+                                    credit = v
+                            else:  # x >= 529
+                                v = _bob_amt(t)
+                                if v is not None and balance == 0.0:
+                                    balance = v
+
+                    elif 4 <= diff <= 22:
+                        # ── DESCRIPTION BAND ─────────────────────────────
+                        # Narration row(s) appear 4–22 pts above the serial row.
+                        # Skip if this y belongs to another transaction's serial row.
+                        if top2 in serial_ys:
+                            continue
+                        for w in rw2_s:
+                            x, t = w["x0"], w["text"]
+                            if _B_VALDATE_END <= x < _B_DESC_END:
+                                if (
+                                    not _B_JUNK.match(t)
+                                    and t not in _B_SKIP_WORDS
+                                    and len(t) > 2
+                                ):
+                                    desc_parts.insert(0, t)  # prepend (above = earlier)
+
+                # Deduplicate description tokens (preserve insertion order)
+                seen = []
+                for part in desc_parts:
+                    if part not in seen:
+                        seen.append(part)
+
+                transactions.append(
+                    {
+                        "date": txn_date,
+                        "narration": " ".join(seen),
+                        "ref_no": value_date or "",
+                        "value_date": value_date or "",
+                        "debit": debit,
+                        "credit": credit,
+                        "balance": balance,
+                    }
+                )
+
+    return pd.DataFrame(transactions)
