@@ -980,7 +980,7 @@ def generate_financial_health_score(
 
     share_text = (
         f"My Bankie financial health score is {total}/100 ({grade}). "
-        f"Check yours free at bankie.in — no sign-up, no data stored."
+        f"Check yours free at bankie.xyz — no sign-up, no data stored."
     )
 
     return {
